@@ -72,6 +72,31 @@ def vae_loss_components(
     }
 
 
+def _image01(x: torch.Tensor):
+    return ((x.detach().float().cpu().squeeze().clamp(-1, 1) + 1.0) / 2.0).numpy()
+
+
+def log_vae_val_images(vae, fixed_val_batch, device, epoch, wandb_logger, amp_enabled, max_samples):
+    """Log fixed validation reconstructions for stable visual monitoring."""
+    if not wandb_logger or fixed_val_batch is None:
+        return
+
+    vae.eval()
+    x = fixed_val_batch[:max_samples].to(device, non_blocking=True)
+    with torch.no_grad():
+        with autocast(enabled=amp_enabled):
+            _, _, _, recon = vae(x)
+
+    n = min(max_samples, x.shape[0])
+    for i in range(n):
+        original = _image01(x[i])
+        reconstructed = _image01(recon[i])
+        error = torch.abs(recon[i].detach().float() - x[i].detach().float()).cpu().squeeze().clamp(0, 2).numpy() / 2.0
+        wandb_logger.log_image(f"val_visual/original_{i}", original, caption=f"epoch {epoch} original", step=epoch)
+        wandb_logger.log_image(f"val_visual/reconstructed_{i}", reconstructed, caption=f"epoch {epoch} reconstructed", step=epoch)
+        wandb_logger.log_image(f"val_visual/error_{i}", error, caption=f"epoch {epoch} absolute error", step=epoch)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train VAE on preprocessed CT slices")
     p.add_argument("--manifest", default="data/manifest.csv")
@@ -86,6 +111,10 @@ def parse_args():
     p.add_argument("--latent-channels", type=int, default=3)
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--resume", default=None)
+    p.add_argument("--start-epoch", type=int, default=0,
+                   help="number of completed epochs when resuming; logging continues from start_epoch + 1")
+    p.add_argument("--initial-best-val", type=float, default=None,
+                   help="previous best validation loss when resuming")
     p.add_argument("--perceptual-weight", type=float, default=0.1)
     p.add_argument("--ssim-weight", type=float, default=0.8)
     p.add_argument("--mse-weight", type=float, default=0.0)
@@ -93,6 +122,10 @@ def parse_args():
     p.add_argument("--l1-weight", type=float, default=1.0)
     p.add_argument("--max-train-batches", type=int, default=None)
     p.add_argument("--max-val-batches", type=int, default=None)
+    p.add_argument("--vis-every", type=int, default=10,
+                   help="upload fixed validation reconstructions to WandB every N epochs; 0 disables")
+    p.add_argument("--vis-num-samples", type=int, default=4,
+                   help="number of fixed validation samples to visualize")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="cbct2sct_IBA")
@@ -165,19 +198,25 @@ def main():
             notes="Full CT VAE training on synthRAD2023/2025 preprocessed slices",
         )
 
+    fixed_val_batch = None
+    if wandb_logger and args.vis_every and args.vis_every > 0:
+        fixed_val_batch = next(iter(val_loader))[:args.vis_num_samples].contiguous()
+        print(f"Fixed val visualization batch: {tuple(fixed_val_batch.shape)} every {args.vis_every} epochs")
+
     print(f"Train slices : {len(train_ds)}")
     print(f"Val slices   : {len(val_ds)}")
     print(f"Batch size   : {args.batch_size}")
     print(f"AMP enabled  : {amp_enabled}")
     print(f"Save dir     : {args.save_dir}")
 
-    best_val = float("inf")
+    best_val = args.initial_best_val if args.initial_best_val is not None else float("inf")
     bad_epochs = 0
     best_path = os.path.join(args.save_dir, "vae_best.pth")
     last_path = os.path.join(args.save_dir, "vae_last.pth")
 
     try:
-        for epoch in range(args.epochs):
+        for epoch in range(args.start_epoch, args.epochs):
+            epoch_num = epoch + 1
             vae.train()
             train_total = 0.0
             train_parts = {}
@@ -250,14 +289,14 @@ def main():
             train_metrics = {f"train/{k.split('/')[-1]}": v / max(train_batches, 1) for k, v in train_parts.items()}
             val_metrics = {f"val/{k.split('/')[-1]}": v / max(val_batches, 1) for k, v in val_parts.items()}
             print(
-                f"Epoch {epoch + 1}/{args.epochs} | "
+                f"Epoch {epoch_num}/{args.epochs} | "
                 f"Train {avg_train:.6f} | Val {avg_val:.6f} | LR {lr:.2e}"
             )
 
             if wandb_logger:
                 wandb_logger.log_metrics(
                     {
-                        "epoch": epoch + 1,
+                        "epoch": epoch_num,
                         "train_loss": avg_train,
                         "val_loss": avg_val,
                         "learning_rate": lr,
@@ -266,7 +305,7 @@ def main():
                         **train_metrics,
                         **val_metrics,
                     },
-                    step=epoch + 1,
+                    step=epoch_num,
                 )
 
             torch.save(vae.state_dict(), last_path)
@@ -277,6 +316,17 @@ def main():
                 print(f"Saved best VAE: {best_path} (val {best_val:.6f})")
             else:
                 bad_epochs += 1
+
+            if wandb_logger and args.vis_every and args.vis_every > 0 and epoch_num % args.vis_every == 0:
+                log_vae_val_images(
+                    vae=vae,
+                    fixed_val_batch=fixed_val_batch,
+                    device=device,
+                    epoch=epoch_num,
+                    wandb_logger=wandb_logger,
+                    amp_enabled=amp_enabled,
+                    max_samples=args.vis_num_samples,
+                )
 
             if args.early_stopping and bad_epochs >= args.early_stopping:
                 print(f"Early stopped after {args.early_stopping} epochs without improvement.")
