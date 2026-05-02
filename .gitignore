@@ -1,0 +1,24 @@
+# ── 医療データ・前処理出力
+rawdata/
+data/
+
+# ── モデルチェックポイント・推論結果
+checkpoints/
+outputs/
+*.pth
+*.ckpt
+
+# ── WandB
+wandb/
+
+# ── Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ── その他
+.DS_Store
+*.egg-info/
+dist/
+build/
