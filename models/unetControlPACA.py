@@ -109,7 +109,7 @@ class UNetControlPaca(nn.Module):
         h = nonlinearity(h)
         h = self.final_conv(h)
         return h
-    
+
 def load_unet_control_paca(unet_save_path=None, paca_save_path=None, unet_trainable=False, paca_trainable=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     unetControlPACA = UNetControlPaca().to(device)
@@ -120,6 +120,7 @@ def load_unet_control_paca(unet_save_path=None, paca_save_path=None, unet_traina
         if paca_unexpected_keys:
             print(f"Unexpected keys in PACA state_dict: {paca_unexpected_keys}")
 
+    unet_state_dict = None
     if unet_save_path is None:
         print("UNet initialized with random weights.")
     else: 
@@ -130,16 +131,16 @@ def load_unet_control_paca(unet_save_path=None, paca_save_path=None, unet_traina
 
     for param in unetControlPACA.parameters():
         param.requires_grad = unet_trainable
-    
+
     paca_params = 0
     for name, param in unetControlPACA.named_parameters():
         if 'paca' in name.lower():
             param.requires_grad = paca_trainable
             paca_params += param.numel()
     
-    unet_control_paca_params = sum(p.numel() for p in unetControlPACA.parameters())
-    unet_params = sum(p.numel() for p in unet_state_dict.values())
     if unet_save_path:
+        unet_control_paca_params = sum(p.numel() for p in unetControlPACA.parameters())
+        unet_params = sum(p.numel() for p in unet_state_dict.values())
         if unet_control_paca_params - paca_params != unet_params:
             print(f"WARNING: UNetControlPACA parameters - PACA parameters should be equal to the loaded state_dict parameters.")
             print(f"Loaded state_dict parameters: {unet_params}")
@@ -1144,4 +1145,3 @@ def test_dr_control_paca(
                     break
             if saved_count >= num_images_to_save:
                 break
-    

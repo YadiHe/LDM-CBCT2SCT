@@ -2,7 +2,7 @@
 """
 预处理脚本：synthRAD2023 (Brain) + synthRAD2025 (AB/HN/TH)
 
-流程: HU clip → 前景裁剪 → 等比缩放+中心 Padding → 归一化 → 保存 MHA
+流程: MONAI Load/Transform → HU clip → 前景裁剪 → 等比缩放+中心 Padding → 归一化 → 保存 MHA
 输出: data/preprocessed/{pid}/*.mha  +  manifest.csv
 
 用法:
@@ -14,13 +14,33 @@
 import os
 import sys
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 import SimpleITK as sitk
 import pandas as pd
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
-from skimage.transform import resize as sk_resize
+
+# ITK 5.4.x still touches np.bool during import under numpy 1.24.
+if "bool" not in np.__dict__:
+    np.bool = bool
+
+try:
+    from monai.transforms import (
+        Compose,
+        EnsureTyped,
+        ScaleIntensityRanged,
+        MapTransform,
+        Resized,
+        SpatialPadd,
+    )
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError(
+        'MONAI is required for preprocessing. Install it with: pip install "monai[itk,nibabel]"'
+    ) from e
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -68,31 +88,57 @@ def find_patients(raw_dir: str):
     return sorted(result)
 
 
-def load_patient(patient_dir: str):
-    """
-    Load CT, CBCT, mask.
-    Returns numpy arrays (D, H, W): ct/cbct float32 HU, mask uint8 binary.
-    """
+def get_patient_paths(patient_dir: str) -> dict:
+    """Return CT/CBCT/mask paths for one patient directory."""
     d = Path(patient_dir)
     ext = ".nii.gz" if (d / "ct.nii.gz").exists() else ".mha"
-
-    def read(name):
-        return sitk.GetArrayFromImage(sitk.ReadImage(str(d / (name + ext))))
-
-    ct   = read("ct").astype(np.float32)
-    cbct = read("cbct").astype(np.float32)
-    mask = read("mask").astype(np.uint8)
-    return ct, cbct, mask
+    return {
+        "ct": str(d / ("ct" + ext)),
+        "cbct": str(d / ("cbct" + ext)),
+        "mask": str(d / ("mask" + ext)),
+    }
 
 
-def save_vol(arr: np.ndarray, path: str):
+def read_geometry(path: str) -> dict:
+    """Read ITK geometry in x/y/z order."""
+    img = sitk.ReadImage(path)
+    return {
+        "spacing": list(img.GetSpacing()),
+        "origin": list(img.GetOrigin()),
+        "direction": list(img.GetDirection()),
+        "size": list(img.GetSize()),
+    }
+
+
+def save_vol(arr: np.ndarray, path: str, geometry: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    sitk.WriteImage(sitk.GetImageFromArray(arr), path, useCompression=True)
+    img = sitk.GetImageFromArray(arr)
+    img.SetSpacing(tuple(geometry["spacing"]))
+    img.SetOrigin(tuple(geometry["origin"]))
+    img.SetDirection(tuple(geometry["direction"]))
+    sitk.WriteImage(img, path, True)
 
 
 # ---------------------------------------------------------------------------
 # Preprocessing helpers
 # ---------------------------------------------------------------------------
+
+def _as_numpy(x) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+class LoadSITKArrayd(MapTransform):
+    """Load medical volumes as channel-first (1, Z, H, W) arrays."""
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.keys:
+            arr = sitk.GetArrayFromImage(sitk.ReadImage(d[key]))
+            d[key] = arr[None]
+        return d
+
 
 def get_xy_bbox(mask: np.ndarray):
     """
@@ -115,41 +161,219 @@ def get_xy_bbox(mask: np.ndarray):
     return h0, h1, w0, w1
 
 
-def resize_vol(arr: np.ndarray, new_H: int, new_W: int, is_mask: bool = False) -> np.ndarray:
-    """Resize (D, H, W) in H,W only. Nearest for mask, bilinear for images."""
-    D, H, W = arr.shape
-    if new_H == H and new_W == W:
-        return arr.copy()
-    order = 0 if is_mask else 1
-    anti  = (not is_mask) and (new_H < H or new_W < W)
-    return sk_resize(arr, (D, new_H, new_W),
-                     order=order, anti_aliasing=anti,
-                     preserve_range=True).astype(arr.dtype)
+class MaskForegroundCropd(MapTransform):
+    """Crop all keys to the XY union bbox of mask foreground."""
+
+    def __init__(self, keys, source_key="mask", margin=10):
+        super().__init__(keys)
+        self.source_key = source_key
+        self.margin = margin
+
+    def __call__(self, data):
+        d = dict(data)
+        mask = _as_numpy(d[self.source_key][0])
+        h0, h1, w0, w1 = get_xy_bbox(mask)
+        for key in self.keys:
+            d[key] = d[key][..., h0:h1, w0:w1]
+        d["preprocess_meta"]["crop_bbox_xy"] = {
+            "h0": int(h0), "h1": int(h1), "w0": int(w0), "w1": int(w1),
+        }
+        return d
 
 
-def center_pad(arr: np.ndarray, target: int, val: float = 0.0) -> np.ndarray:
-    """Center-pad (D, H, W) to (D, target, target)."""
-    D, H, W = arr.shape
-    assert H <= target and W <= target, f"Cannot pad {H}×{W} to {target}×{target}"
-    ph, pw = target - H, target - W
-    return np.pad(arr,
-                  ((0, 0), (ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2)),
-                  constant_values=val)
+class ResizeWithAspectRatioAndPadd(MapTransform):
+    """Resize long side to target and center-pad short side to target."""
+
+    def __init__(self, keys, target_size=256, pad_value=-1024.0, mask_key="mask"):
+        super().__init__(keys)
+        self.target = target_size
+        self.pad_value = pad_value
+        self.mask_key = mask_key
+
+    def __call__(self, data):
+        d = dict(data)
+        H, W = int(d[self.keys[0]].shape[-2]), int(d[self.keys[0]].shape[-1])
+        scale = self.target / max(H, W)
+        new_H, new_W = round(H * scale), round(W * scale)
+        pad_h, pad_w = self.target - new_H, self.target - new_W
+
+        img_keys = [k for k in self.keys if k != self.mask_key]
+        mask_keys = [k for k in self.keys if k == self.mask_key]
+
+        if img_keys:
+            d = Resized(
+                keys=img_keys,
+                spatial_size=(-1, new_H, new_W),
+                mode="bilinear",
+                anti_aliasing=(scale < 1.0),
+            )(d)
+            d = SpatialPadd(
+                keys=img_keys,
+                spatial_size=(-1, self.target, self.target),
+                mode="constant",
+                constant_values=self.pad_value,
+            )(d)
+        if mask_keys:
+            d = Resized(
+                keys=mask_keys,
+                spatial_size=(-1, new_H, new_W),
+                mode="nearest",
+            )(d)
+            d = SpatialPadd(
+                keys=mask_keys,
+                spatial_size=(-1, self.target, self.target),
+                mode="constant",
+                constant_values=0,
+            )(d)
+
+        d["preprocess_meta"]["resize_pad"] = {
+            "target": int(self.target),
+            "crop_shape_hw": [int(H), int(W)],
+            "resized_shape_hw": [int(new_H), int(new_W)],
+            "scale": float(scale),
+            "pad_top": int(pad_h // 2),
+            "pad_bottom": int(pad_h - pad_h // 2),
+            "pad_left": int(pad_w // 2),
+            "pad_right": int(pad_w - pad_w // 2),
+        }
+        return d
 
 
-def make_cbct_global(cbct_clipped: np.ndarray) -> np.ndarray:
+class BinarizeMaskd(MapTransform):
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.keys:
+            d[key] = (d[key] > 0.5).to(torch.float32)
+        return d
+
+
+def build_preprocess_transform():
+    return Compose([
+        LoadSITKArrayd(keys=["ct", "cbct", "mask"]),
+        EnsureTyped(keys=["ct", "cbct"], dtype=torch.float32),
+        EnsureTyped(keys=["mask"], dtype=torch.uint8),
+        ScaleIntensityRanged(
+            keys=["ct", "cbct"],
+            a_min=CLIP_MIN,
+            a_max=CLIP_MAX,
+            b_min=CLIP_MIN,
+            b_max=CLIP_MAX,
+            clip=True,
+        ),
+        MaskForegroundCropd(keys=["ct", "cbct", "mask"], source_key="mask", margin=MARGIN),
+        ResizeWithAspectRatioAndPadd(
+            keys=["ct", "cbct", "mask"],
+            target_size=TARGET,
+            pad_value=CLIP_MIN,
+            mask_key="mask",
+        ),
+        ScaleIntensityRanged(
+            keys=["ct", "cbct"],
+            a_min=CLIP_MIN,
+            a_max=CLIP_MAX,
+            b_min=-1.0,
+            b_max=1.0,
+            clip=True,
+        ),
+        BinarizeMaskd(keys=["mask"]),
+    ])
+
+
+def build_global_transform():
+    return Compose([
+        LoadSITKArrayd(keys=["cbct"]),
+        EnsureTyped(keys=["cbct"], dtype=torch.float32),
+        ScaleIntensityRanged(
+            keys=["cbct"],
+            a_min=CLIP_MIN,
+            a_max=CLIP_MAX,
+            b_min=CLIP_MIN,
+            b_max=CLIP_MAX,
+            clip=True,
+        ),
+        ResizeWithAspectRatioAndPadd(
+            keys=["cbct"],
+            target_size=TARGET,
+            pad_value=CLIP_MIN,
+            mask_key="mask",
+        ),
+        ScaleIntensityRanged(
+            keys=["cbct"],
+            a_min=CLIP_MIN,
+            a_max=CLIP_MAX,
+            b_min=-1.0,
+            b_max=1.0,
+            clip=True,
+        ),
+    ])
+
+
+def output_geometry(original: dict, meta: dict) -> dict:
+    """Compute geometry for cropped/resized/padded output in original orientation."""
+    bbox = meta["crop_bbox_xy"]
+    rp = meta["resize_pad"]
+    scale = rp["scale"]
+    in_spacing = original["spacing"]
+    out_spacing = [float(in_spacing[0] / scale), float(in_spacing[1] / scale), float(in_spacing[2])]
+
+    # Direction is row-major 3x3, spacing/origin are x/y/z. Offset accounts for
+    # crop in original pixels and padding in output pixels.
+    direction = np.asarray(original["direction"], dtype=np.float64).reshape(3, 3)
+    offset_index = np.asarray([
+        bbox["w0"] * in_spacing[0] - rp["pad_left"] * out_spacing[0],
+        bbox["h0"] * in_spacing[1] - rp["pad_top"] * out_spacing[1],
+        0.0,
+    ])
+    origin = np.asarray(original["origin"], dtype=np.float64) + direction.dot(offset_index)
+
+    return {
+        "spacing": out_spacing,
+        "origin": origin.tolist(),
+        "direction": original["direction"],
+    }
+
+
+def restore_preprocessed_to_original(
+    arr: np.ndarray,
+    preprocess_meta: dict,
+    fill_value: float = -1.0,
+    is_mask: bool = False,
+) -> np.ndarray:
     """
-    Full-volume CBCT (before foreground crop) resized to TARGET×TARGET
-    and normalized to [-1, 1]. Saved per-patient for Phase 2 use.
+    Restore a preprocessed (Z, 256, 256) volume to the original (Z, H, W) grid.
+
+    This is intended for inference/QC symmetry: remove center padding, resize
+    back to the mask-crop shape, then paste into the original XY canvas.
     """
-    D, H, W = cbct_clipped.shape
-    sc = TARGET / max(H, W)
-    r  = resize_vol(cbct_clipped, round(H * sc), round(W * sc))
-    r  = center_pad(r, TARGET, CLIP_MIN)
-    return ((r - CLIP_MIN) / (CLIP_MAX - CLIP_MIN) * 2.0 - 1.0).astype(np.float32)
+    rp = preprocess_meta["resize_pad"]
+    bbox = preprocess_meta["crop_bbox_xy"]
+    orig_size = preprocess_meta["original_geometry"]["size"]  # x/y/z
+    orig_w, orig_h, orig_z = int(orig_size[0]), int(orig_size[1]), int(orig_size[2])
+    crop_h, crop_w = rp["crop_shape_hw"]
+
+    z = arr.shape[0]
+    if z != orig_z:
+        raise ValueError(f"Z mismatch: preprocessed has {z}, original metadata has {orig_z}")
+
+    h0 = rp["pad_top"]
+    h1 = arr.shape[1] - rp["pad_bottom"]
+    w0 = rp["pad_left"]
+    w1 = arr.shape[2] - rp["pad_right"]
+    cropped = arr[:, h0:h1, w0:w1]
+
+    mode = "nearest" if is_mask else "bilinear"
+    t = torch.from_numpy(cropped.astype(np.float32)).unsqueeze(1)
+    kwargs = {} if is_mask else {"align_corners": False}
+    restored_crop = F.interpolate(t, size=(crop_h, crop_w), mode=mode, **kwargs).squeeze(1).numpy()
+
+    restored = np.full((orig_z, orig_h, orig_w), fill_value, dtype=np.float32)
+    restored[:, bbox["h0"]:bbox["h1"], bbox["w0"]:bbox["w1"]] = restored_crop
+    if is_mask:
+        restored = (restored > 0.5).astype(np.float32)
+    return restored
 
 
-def preprocess(ct_raw: np.ndarray, cbct_raw: np.ndarray, mask_raw: np.ndarray):
+def preprocess(patient_paths: dict, original_geometry: dict):
     """
     Full preprocessing pipeline for one patient volume.
 
@@ -159,34 +383,48 @@ def preprocess(ct_raw: np.ndarray, cbct_raw: np.ndarray, mask_raw: np.ndarray):
         mask_pp : (D, 256, 256) float32, binary {0, 1}
         cbct_global : (D, 256, 256) float32, pre-crop full-body CBCT, normalized
     """
-    # Step 2: HU clip
-    ct   = np.clip(ct_raw,   CLIP_MIN, CLIP_MAX)
-    cbct = np.clip(cbct_raw, CLIP_MIN, CLIP_MAX)
+    data = {
+        **patient_paths,
+        "preprocess_meta": {
+            "clip": [CLIP_MIN, CLIP_MAX],
+            "margin": MARGIN,
+            "original_geometry": original_geometry,
+        },
+    }
+    local = build_preprocess_transform()(data)
 
-    # Step 6: cbct_global — derived from clipped but UNCROPPED CBCT
-    cbct_global = make_cbct_global(cbct)
+    global_data = {
+        "cbct": patient_paths["cbct"],
+        "preprocess_meta": {
+            "clip": [CLIP_MIN, CLIP_MAX],
+            "margin": 0,
+            "crop_bbox_xy": {
+                "h0": 0,
+                "h1": original_geometry["size"][1],
+                "w0": 0,
+                "w1": original_geometry["size"][0],
+            },
+            "original_geometry": original_geometry,
+        },
+    }
+    global_pp = build_global_transform()(global_data)
 
-    # Step 3: foreground crop (XY union bbox of body mask)
-    h0, h1, w0, w1 = get_xy_bbox(mask_raw)
-    ct   = ct  [:, h0:h1, w0:w1]
-    cbct = cbct[:, h0:h1, w0:w1]
-    mask = mask_raw[:, h0:h1, w0:w1]
+    meta = local["preprocess_meta"]
+    meta["output_geometry"] = output_geometry(original_geometry, meta)
+    meta["global_resize_pad"] = global_pp["preprocess_meta"]["resize_pad"]
+    meta["global_output_geometry"] = output_geometry(
+        original_geometry,
+        {
+            "crop_bbox_xy": global_data["preprocess_meta"]["crop_bbox_xy"],
+            "resize_pad": global_pp["preprocess_meta"]["resize_pad"],
+        },
+    )
 
-    # Step 4: aspect-ratio resize, then center pad to 256×256
-    D, H, W = ct.shape
-    sc  = TARGET / max(H, W)
-    nH, nW = round(H * sc), round(W * sc)
+    def volume(key, d=local):
+        return _as_numpy(d[key][0]).astype(np.float32)
 
-    ct   = center_pad(resize_vol(ct,                        nH, nW, False), TARGET, CLIP_MIN)
-    cbct = center_pad(resize_vol(cbct,                      nH, nW, False), TARGET, CLIP_MIN)
-    mf   = center_pad(resize_vol(mask.astype(np.float32),   nH, nW, True),  TARGET, 0.0)
-    mask_pp = (mf > 0.5).astype(np.float32)
-
-    # Step 5: normalize to [-1, 1]
-    def norm(x):
-        return ((x - CLIP_MIN) / (CLIP_MAX - CLIP_MIN) * 2.0 - 1.0).astype(np.float32)
-
-    return norm(ct), norm(cbct), mask_pp, cbct_global
+    cbct_global = _as_numpy(global_pp["cbct"][0]).astype(np.float32)
+    return volume("ct"), volume("cbct"), volume("mask"), cbct_global, meta
 
 
 # ---------------------------------------------------------------------------
@@ -267,18 +505,23 @@ def main():
         pid_out = os.path.join(out_dir, pid)
 
         try:
-            ct_raw, cbct_raw, mask_raw = load_patient(pdir)
-            ct_pp, cbct_pp, mask_pp, cbct_global = preprocess(ct_raw, cbct_raw, mask_raw)
+            patient_paths = get_patient_paths(pdir)
+            original_geometry = read_geometry(patient_paths["ct"])
+            ct_pp, cbct_pp, mask_pp, cbct_global, pp_meta = preprocess(patient_paths, original_geometry)
 
-            ct_path   = os.path.join(pid_out, "ct.mha")
-            cbct_path = os.path.join(pid_out, "cbct.mha")
-            mask_path = os.path.join(pid_out, "mask.mha")
+            ct_path   = os.path.join(pid_out, "ct_preprocessed.mha")
+            cbct_path = os.path.join(pid_out, "cbct_preprocessed.mha")
+            mask_path = os.path.join(pid_out, "mask_preprocessed.mha")
             glob_path = os.path.join(pid_out, "cbct_global.mha")
+            meta_path = os.path.join(pid_out, "preprocess_metadata.json")
 
-            save_vol(ct_pp,      ct_path)
-            save_vol(cbct_pp,    cbct_path)
-            save_vol(mask_pp,    mask_path)
-            save_vol(cbct_global, glob_path)
+            save_vol(ct_pp,      ct_path,   pp_meta["output_geometry"])
+            save_vol(cbct_pp,    cbct_path, pp_meta["output_geometry"])
+            save_vol(mask_pp,    mask_path, pp_meta["output_geometry"])
+            save_vol(cbct_global, glob_path, pp_meta["global_output_geometry"])
+            os.makedirs(pid_out, exist_ok=True)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(pp_meta, f, indent=2)
 
             manifest_rows.append({
                 "patient_id":       pid,
@@ -288,6 +531,7 @@ def main():
                 "cbct_path":        cbct_path,
                 "mask_path":        mask_path,
                 "cbct_global_path": glob_path,
+                "preprocess_meta_path": meta_path,
             })
         except Exception as e:
             print(f"\n  [error] {pid}: {e}")

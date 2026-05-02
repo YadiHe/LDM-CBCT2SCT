@@ -45,12 +45,26 @@ class DegradationRemoval(nn.Module):
 
         return embedding, intermediate_preds
     
-def degradation_loss(intermediate_preds, ground_truth):
+def degradation_loss(intermediate_preds, ground_truth, mask=None):
     pred_128, pred_64 = intermediate_preds
     gt_128 = F.interpolate(ground_truth, size=(128, 128), mode='area')
     gt_64 = F.interpolate(ground_truth, size=(64, 64), mode='area')
-    loss_128 = F.l1_loss(pred_128, gt_128)
-    loss_64 = F.l1_loss(pred_64, gt_64)
+
+    if mask is None:
+        loss_128 = F.l1_loss(pred_128, gt_128)
+        loss_64 = F.l1_loss(pred_64, gt_64)
+        return loss_128 + loss_64
+
+    mask_128 = F.interpolate(mask.float(), size=(128, 128), mode='area') > 0.5
+    mask_64 = F.interpolate(mask.float(), size=(64, 64), mode='area') > 0.5
+
+    def masked_l1(pred, target, weight):
+        weight = weight.to(dtype=pred.dtype)
+        denom = weight.sum().clamp_min(1.0)
+        return (torch.abs(pred - target) * weight).sum() / denom
+
+    loss_128 = masked_l1(pred_128, gt_128, mask_128)
+    loss_64 = masked_l1(pred_64, gt_64, mask_64)
     return loss_128 + loss_64
 
 def load_degradation_removal(save_path=None, trainable=False):

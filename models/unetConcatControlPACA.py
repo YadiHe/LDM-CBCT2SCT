@@ -73,25 +73,25 @@ class UNetConcatControlPACA(nn.Module):
         h, (down_res_4_1, down_res_4_2) = self.down4(h, t_emb)
 
         if control_paca:
-            down_res_1_1 += additional_down_res_1_1
-            down_res_1_2 += additional_down_res_1_2
-            down_res_2_1 += additional_down_res_2_1
-            down_res_2_2 += additional_down_res_2_2
-            down_res_3_1 += additional_down_res_3_1
-            down_res_3_2 += additional_down_res_3_2
-            down_res_4_1 += additional_down_res_4_1
-            down_res_4_2 += additional_down_res_4_2
+            down_res_1_1 = down_res_1_1 + additional_down_res_1_1
+            down_res_1_2 = down_res_1_2 + additional_down_res_1_2
+            down_res_2_1 = down_res_2_1 + additional_down_res_2_1
+            down_res_2_2 = down_res_2_2 + additional_down_res_2_2
+            down_res_3_1 = down_res_3_1 + additional_down_res_3_1
+            down_res_3_2 = down_res_3_2 + additional_down_res_3_2
+            down_res_4_1 = down_res_4_1 + additional_down_res_4_1
+            down_res_4_2 = down_res_4_2 + additional_down_res_4_2
 
         if extra_control:
-            down_res_1_1 += extra_additional_down_res_1_1
-            down_res_1_2 += extra_additional_down_res_1_2
-            down_res_2_1 += extra_additional_down_res_2_1
-            down_res_2_2 += extra_additional_down_res_2_2
-            down_res_3_1 += extra_additional_down_res_3_1
-            down_res_3_2 += extra_additional_down_res_3_2
-            down_res_4_1 += extra_additional_down_res_4_1
-            down_res_4_2 += extra_additional_down_res_4_2
-            middle_paca_control_residual += middle_control_residual
+            down_res_1_1 = down_res_1_1 + extra_additional_down_res_1_1
+            down_res_1_2 = down_res_1_2 + extra_additional_down_res_1_2
+            down_res_2_1 = down_res_2_1 + extra_additional_down_res_2_1
+            down_res_2_2 = down_res_2_2 + extra_additional_down_res_2_2
+            down_res_3_1 = down_res_3_1 + extra_additional_down_res_3_1
+            down_res_3_2 = down_res_3_2 + extra_additional_down_res_3_2
+            down_res_4_1 = down_res_4_1 + extra_additional_down_res_4_1
+            down_res_4_2 = down_res_4_2 + extra_additional_down_res_4_2
+            middle_paca_control_residual = middle_paca_control_residual + middle_control_residual
 
         h = self.middle(h, t_emb)
 
@@ -123,6 +123,7 @@ def load_unet_concat_control_paca(unet_save_path=None, paca_save_path=None, unet
         if paca_unexpected_keys:
             print(f"Unexpected keys in PACA state_dict: {paca_unexpected_keys}")
 
+    unet_state_dict = None
     if unet_save_path is None:
         print("UNet initialized with random weights.")
     else: 
@@ -140,9 +141,9 @@ def load_unet_concat_control_paca(unet_save_path=None, paca_save_path=None, unet
             param.requires_grad = paca_trainable
             paca_params += param.numel()
     
-    unet_control_paca_params = sum(p.numel() for p in unetConcatControlPACA.parameters())
-    unet_params = sum(p.numel() for p in unet_state_dict.values())
     if unet_save_path:
+        unet_control_paca_params = sum(p.numel() for p in unetConcatControlPACA.parameters())
+        unet_params = sum(p.numel() for p in unet_state_dict.values())
         if unet_control_paca_params - paca_params != unet_params:
             print(f"WARNING: UNetControlPACA parameters - PACA parameters should be equal to the loaded state_dict parameters.")
             print(f"Loaded state_dict parameters: {unet_params}")
@@ -250,7 +251,7 @@ def train_unet_concat_control_paca(
             # Mask-weighted diffusion loss: exclude padding (air) regions
             latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
             loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
-            loss_dr = degradation_loss(intermediate_preds, ct_img)
+            loss_dr = degradation_loss(intermediate_preds, ct_img, mask)
             total_loss = loss_diff + gamma * loss_dr
 
             total_loss.backward()
@@ -291,7 +292,7 @@ def train_unet_concat_control_paca(
 
                 controlnet_input, intermediate_preds = dr_module(cbct_img)
 
-                loss_dr = degradation_loss(intermediate_preds, ct_img)
+                loss_dr = degradation_loss(intermediate_preds, ct_img, mask)
 
                 t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
                 noise = torch.randn(
