@@ -30,7 +30,7 @@ class WandbLogger:
 
     def __init__(
         self,
-        project: str = "cbct-sct-ldm",
+        project: str = "cbct2sct_IBA",
         name: str = None,
         config: dict = None,
         tags: list = None,
@@ -323,7 +323,7 @@ def setup_wandb(
         full_tags.extend(tags)
 
     return WandbLogger(
-        project="cbct-sct-ldm",
+        project="cbct2sct_IBA",
         name=f"{experiment_name}_{architecture}",
         config={
             "architecture": architecture,

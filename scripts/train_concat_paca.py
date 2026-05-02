@@ -75,7 +75,7 @@ def parse_args():
 
     # WandB
     p.add_argument("--no-wandb", action="store_true", help="disable WandB logging")
-    p.add_argument("--wandb-project", type=str, default="cbct-sct-ldm",
+    p.add_argument("--wandb-project", type=str, default="cbct2sct_IBA",
                    help="WandB project name")
     p.add_argument("--wandb-name", type=str, default=None,
                    help="WandB run name")

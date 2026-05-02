@@ -465,7 +465,7 @@ python scripts/train_concat_paca.py \
   --batch-size 16 \
   --epochs 300 \
   --lr 5e-6 \
-  --wandb-project cbct-sct-ldm
+  --wandb-project cbct2sct_IBA
 ```
 
 可用 `--no-wandb` 关闭。短跑/调试可用：

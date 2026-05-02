@@ -73,7 +73,7 @@ def parse_args():
     # WandB 参数
     parser.add_argument('--no-wandb', action='store_true',
                         help='禁用 wandb')
-    parser.add_argument('--wandb-project', type=str, default='cbct-sct-ldm',
+    parser.add_argument('--wandb-project', type=str, default='cbct2sct_IBA',
                         help='WandB 项目名')
 
     # 混合精度参数
