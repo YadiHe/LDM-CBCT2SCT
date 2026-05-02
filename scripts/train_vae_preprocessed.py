@@ -76,13 +76,13 @@ def _image01(x: torch.Tensor):
     return ((x.detach().float().cpu().squeeze().clamp(-1, 1) + 1.0) / 2.0).numpy()
 
 
-def log_vae_val_images(vae, fixed_val_batch, device, epoch, wandb_logger, amp_enabled, max_samples):
-    """Log fixed validation reconstructions for stable visual monitoring."""
-    if not wandb_logger or fixed_val_batch is None:
+def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, max_samples, prefix):
+    """Log fixed reconstructions for stable visual monitoring."""
+    if not wandb_logger or fixed_batch is None:
         return
 
     vae.eval()
-    x = fixed_val_batch[:max_samples].to(device, non_blocking=True)
+    x = fixed_batch[:max_samples].to(device, non_blocking=True)
     with torch.no_grad():
         with autocast(enabled=amp_enabled):
             _, _, _, recon = vae(x)
@@ -92,9 +92,9 @@ def log_vae_val_images(vae, fixed_val_batch, device, epoch, wandb_logger, amp_en
         original = _image01(x[i])
         reconstructed = _image01(recon[i])
         error = torch.abs(recon[i].detach().float() - x[i].detach().float()).cpu().squeeze().clamp(0, 2).numpy() / 2.0
-        wandb_logger.log_image(f"val_visual/original_{i}", original, caption=f"epoch {epoch} original", step=epoch)
-        wandb_logger.log_image(f"val_visual/reconstructed_{i}", reconstructed, caption=f"epoch {epoch} reconstructed", step=epoch)
-        wandb_logger.log_image(f"val_visual/error_{i}", error, caption=f"epoch {epoch} absolute error", step=epoch)
+        wandb_logger.log_image(f"{prefix}_visual/original_{i}", original, caption=f"epoch {epoch} {prefix} original", step=epoch)
+        wandb_logger.log_image(f"{prefix}_visual/reconstructed_{i}", reconstructed, caption=f"epoch {epoch} {prefix} reconstructed", step=epoch)
+        wandb_logger.log_image(f"{prefix}_visual/error_{i}", error, caption=f"epoch {epoch} {prefix} absolute error", step=epoch)
 
 
 def parse_args():
@@ -123,9 +123,9 @@ def parse_args():
     p.add_argument("--max-train-batches", type=int, default=None)
     p.add_argument("--max-val-batches", type=int, default=None)
     p.add_argument("--vis-every", type=int, default=10,
-                   help="upload fixed validation reconstructions to WandB every N epochs; 0 disables")
+                   help="upload fixed train/validation reconstructions to WandB every N epochs; 0 disables")
     p.add_argument("--vis-num-samples", type=int, default=4,
-                   help="number of fixed validation samples to visualize")
+                   help="number of fixed train and validation samples to visualize")
     p.add_argument("--no-amp", action="store_true")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="cbct2sct_IBA")
@@ -198,10 +198,15 @@ def main():
             notes="Full CT VAE training on synthRAD2023/2025 preprocessed slices",
         )
 
+    fixed_train_batch = None
     fixed_val_batch = None
     if wandb_logger and args.vis_every and args.vis_every > 0:
+        fixed_train_batch = next(iter(train_loader))[:args.vis_num_samples].contiguous()
         fixed_val_batch = next(iter(val_loader))[:args.vis_num_samples].contiguous()
-        print(f"Fixed val visualization batch: {tuple(fixed_val_batch.shape)} every {args.vis_every} epochs")
+        print(
+            f"Fixed visualization batches every {args.vis_every} epochs | "
+            f"train {tuple(fixed_train_batch.shape)} | val {tuple(fixed_val_batch.shape)}"
+        )
 
     print(f"Train slices : {len(train_ds)}")
     print(f"Val slices   : {len(val_ds)}")
@@ -318,14 +323,25 @@ def main():
                 bad_epochs += 1
 
             if wandb_logger and args.vis_every and args.vis_every > 0 and epoch_num % args.vis_every == 0:
-                log_vae_val_images(
+                log_vae_images(
                     vae=vae,
-                    fixed_val_batch=fixed_val_batch,
+                    fixed_batch=fixed_train_batch,
                     device=device,
                     epoch=epoch_num,
                     wandb_logger=wandb_logger,
                     amp_enabled=amp_enabled,
                     max_samples=args.vis_num_samples,
+                    prefix="train",
+                )
+                log_vae_images(
+                    vae=vae,
+                    fixed_batch=fixed_val_batch,
+                    device=device,
+                    epoch=epoch_num,
+                    wandb_logger=wandb_logger,
+                    amp_enabled=amp_enabled,
+                    max_samples=args.vis_num_samples,
+                    prefix="val",
                 )
 
             if args.early_stopping and bad_epochs >= args.early_stopping:
