@@ -68,6 +68,17 @@ def parse_args():
                    help="weight for DR auxiliary loss: total = L_diff + gamma * L_dr")
     p.add_argument("--early-stopping", type=int,   default=50,
                    help="stop if val loss doesn't improve for this many epochs")
+    p.add_argument("--max-train-batches", type=int, default=None,
+                   help="optional smoke-test limit for train batches per epoch")
+    p.add_argument("--max-val-batches", type=int, default=None,
+                   help="optional smoke-test limit for val batches per epoch")
+
+    # WandB
+    p.add_argument("--no-wandb", action="store_true", help="disable WandB logging")
+    p.add_argument("--wandb-project", type=str, default="cbct-sct-ldm",
+                   help="WandB project name")
+    p.add_argument("--wandb-name", type=str, default=None,
+                   help="WandB run name")
 
     # Resume
     p.add_argument("--unet-path",       default=None,
@@ -130,7 +141,7 @@ def main():
         print(f"ControlNet resumed from: {args.controlnet_path}")
 
     # DegradationRemoval — lightweight pixel-space feature extractor (~0.3M)
-    dr_module = DegradationRemoval(condition_channels=1, final_embedding_channels=256)
+    dr_module = DegradationRemoval(condition_channels=1, final_embedding_channels=args.base_channels)
     if args.dr_path:
         dr_module.load_state_dict(torch.load(args.dr_path, map_location="cpu"))
         print(f"DR module resumed from: {args.dr_path}")
@@ -155,20 +166,54 @@ def main():
     print(f"Epochs: {args.epochs}  LR: {args.lr}  gamma: {args.gamma}  early-stop: {args.early_stopping}")
     print("=" * 60 + "\n")
 
-    train_unet_concat_control_paca(
-        vae=vae,
-        unet=unet,
-        controlnet=controlnet,
-        dr_module=dr_module,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=args.epochs,
-        save_dir=save_dir,
-        predict_dir=predict_dir,
-        early_stopping=args.early_stopping,
-        gamma=args.gamma,
-        learning_rate=args.lr,
-    )
+    wandb_logger = None
+    if not args.no_wandb:
+        from utils.wandb_logger import WandbLogger
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            config={
+                "manifest": args.manifest,
+                "vae_path": args.vae_path,
+                "save_dir": args.save_dir,
+                "batch_size": args.batch_size,
+                "num_workers": args.num_workers,
+                "augmentation": augmentation,
+                "base_channels": args.base_channels,
+                "epochs": args.epochs,
+                "lr": args.lr,
+                "gamma": args.gamma,
+                "early_stopping": args.early_stopping,
+                "max_train_batches": args.max_train_batches,
+                "max_val_batches": args.max_val_batches,
+                "train_slices": len(train_loader.dataset),
+                "val_slices": len(val_loader.dataset),
+            },
+            tags=["concat-paca", "phase1", "preprocessed-mha"],
+            notes="UNetConcatControlPACA Phase 1 training",
+        )
+
+    try:
+        train_unet_concat_control_paca(
+            vae=vae,
+            unet=unet,
+            controlnet=controlnet,
+            dr_module=dr_module,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=args.epochs,
+            save_dir=save_dir,
+            predict_dir=predict_dir,
+            early_stopping=args.early_stopping,
+            gamma=args.gamma,
+            learning_rate=args.lr,
+            wandb_logger=wandb_logger,
+            max_train_batches=args.max_train_batches,
+            max_val_batches=args.max_val_batches,
+        )
+    finally:
+        if wandb_logger:
+            wandb_logger.finish()
 
     print("\n" + "=" * 60)
     print(f"Training finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

@@ -169,6 +169,9 @@ def train_unet_concat_control_paca(
     guidance_scale=1.0, 
     epochs_between_prediction=50, 
     learning_rate=5e-6, 
+    wandb_logger=None,
+    max_train_batches=None,
+    max_val_batches=None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(save_dir, exist_ok=True)
@@ -226,6 +229,8 @@ def train_unet_concat_control_paca(
         train_loss_dr = 0
 
         for i, (ct_img, cbct_img, mask, region_id) in enumerate(train_loader):
+            if max_train_batches is not None and i >= max_train_batches:
+                break
             ct_img    = ct_img.to(device)
             cbct_img  = cbct_img.to(device)
             mask      = mask.to(device)
@@ -263,9 +268,10 @@ def train_unet_concat_control_paca(
             train_loss_diff += loss_diff.item()
             train_loss_dr += loss_dr.item()
             
-        avg_train_loss_total = train_loss_total / len(train_loader)
-        avg_train_loss_diff = train_loss_diff / len(train_loader)
-        avg_train_loss_dr = train_loss_dr / len(train_loader)
+        train_batches = min(len(train_loader), max_train_batches) if max_train_batches is not None else len(train_loader)
+        avg_train_loss_total = train_loss_total / train_batches
+        avg_train_loss_diff = train_loss_diff / train_batches
+        avg_train_loss_dr = train_loss_dr / train_batches
 
         # --- Validation Loop ---
         unet.eval()
@@ -278,7 +284,9 @@ def train_unet_concat_control_paca(
         val_generator = torch.Generator(device=device).manual_seed(42)
 
         with torch.no_grad():
-            for ct_img, cbct_img, mask, region_id in val_loader:
+            for i, (ct_img, cbct_img, mask, region_id) in enumerate(val_loader):
+                if max_val_batches is not None and i >= max_val_batches:
+                    break
                 ct_img    = ct_img.to(device)
                 cbct_img  = cbct_img.to(device)
                 mask      = mask.to(device)
@@ -314,9 +322,10 @@ def train_unet_concat_control_paca(
                 val_loss_diff += loss_diff.item()
                 val_loss_dr += loss_dr.item()
 
-        avg_val_loss_total = val_loss_total / len(val_loader)
-        avg_val_loss_diff = val_loss_diff / len(val_loader)
-        avg_val_loss_dr = val_loss_dr / len(val_loader)
+        val_batches = min(len(val_loader), max_val_batches) if max_val_batches is not None else len(val_loader)
+        avg_val_loss_total = val_loss_total / val_batches
+        avg_val_loss_diff = val_loss_diff / val_batches
+        avg_val_loss_dr = val_loss_dr / val_batches
         
         scheduler.step(avg_val_loss_total)
         early_stopping_counter += 1
@@ -324,6 +333,21 @@ def train_unet_concat_control_paca(
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss_total:.6f} (Diff: {avg_train_loss_diff:.6f}, DR: {avg_train_loss_dr:.6f}) | "
             f"Val Loss: {avg_val_loss_total:.6f} (Diff: {avg_val_loss_diff:.6f}, DR: {avg_val_loss_dr:.6f}) | LR: {current_lr:.1e}")
+        if wandb_logger:
+            wandb_logger.log_training_step(
+                epoch=epoch + 1,
+                train_loss=avg_train_loss_total,
+                val_loss=avg_val_loss_total,
+                learning_rate=current_lr,
+                extra_metrics={
+                    "train/loss_diff": avg_train_loss_diff,
+                    "train/loss_dr": avg_train_loss_dr,
+                    "val/loss_diff": avg_val_loss_diff,
+                    "val/loss_dr": avg_val_loss_dr,
+                    "train/batches": train_batches,
+                    "val/batches": val_batches,
+                },
+            )
         
         if avg_val_loss_total < best_val_loss:
             best_val_loss = avg_val_loss_total
