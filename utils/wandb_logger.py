@@ -34,6 +34,7 @@ class WandbLogger:
         name: str = None,
         config: dict = None,
         tags: list = None,
+        group: str = None,
         notes: str = None,
         enabled: bool = True,
     ):
@@ -64,6 +65,7 @@ class WandbLogger:
             name=name,
             config=config or {},
             tags=tags or [],
+            group=group,
             notes=notes,
             reinit=True,
         )

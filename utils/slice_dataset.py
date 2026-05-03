@@ -38,6 +38,7 @@ class SliceDataset(Dataset):
             raise ValueError(f"No rows found for split='{split}' in {manifest_csv}")
 
         print(f"[SliceDataset:{split}] caching {len(df)} volumes into RAM ...")
+        self.rows: list = []
         self._vols: list = []
         for _, row in df.iterrows():
             ct   = _load_mha(row["ct_path"])     # (D, 256, 256) float32
@@ -45,6 +46,7 @@ class SliceDataset(Dataset):
             mask = _load_mha(row["mask_path"])   # float32 {0, 1}
             rid  = REGION_TO_ID[row["region"]]
             self._vols.append((ct, cbct, mask, rid))
+            self.rows.append(dict(row))
 
         # Build (volume_idx, slice_z) index, skip near-air slices
         self.index: list = []
@@ -74,6 +76,30 @@ class SliceDataset(Dataset):
             ct_t, cbct_t, mask_t = _augment(ct_t, cbct_t, mask_t)
 
         return ct_t, cbct_t, mask_t, rid_t
+
+    def fixed_val_items(self, cases_per_region: int = 4, slices_per_case: int = 3):
+        """Return deterministic fixed-val slices: first patients per region, top mask-area slices."""
+        selected = []
+        by_region = {}
+        for vi, row in enumerate(self.rows):
+            by_region.setdefault(row["region"], []).append((str(row["patient_id"]), vi, row))
+
+        for region in sorted(by_region):
+            for _, vi, row in sorted(by_region[region])[:cases_per_region]:
+                ct, cbct, mask, rid = self._vols[vi]
+                z_indices = np.argsort(mask.reshape(mask.shape[0], -1).sum(axis=1))[-slices_per_case:]
+                z_indices = sorted(int(z) for z in z_indices)
+                for z in z_indices:
+                    selected.append({
+                        "patient_id": str(row["patient_id"]),
+                        "region": region,
+                        "z": z,
+                        "ct": torch.from_numpy(ct[z]).unsqueeze(0),
+                        "cbct": torch.from_numpy(cbct[z]).unsqueeze(0),
+                        "mask": torch.from_numpy(mask[z]).unsqueeze(0),
+                        "region_id": torch.tensor(rid, dtype=torch.long),
+                    })
+        return selected
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +132,7 @@ def get_dataloaders(
     batch_size: int,
     num_workers: int = 4,
     augmentation: bool = True,
+    seed: int = None,
 ):
     """
     Build train and val DataLoaders from a manifest CSV.
@@ -116,6 +143,18 @@ def get_dataloaders(
     train_ds = SliceDataset(manifest_csv, "train", augmentation=augmentation)
     val_ds   = SliceDataset(manifest_csv, "val",   augmentation=False)
 
+    generator = None
+    worker_init_fn = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+        def worker_init_fn(worker_id):
+            worker_seed = (seed + worker_id) % 2**32
+            random.seed(worker_seed)
+            np.random.seed(worker_seed)
+            torch.manual_seed(worker_seed)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -123,6 +162,8 @@ def get_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -131,5 +172,6 @@ def get_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
+        worker_init_fn=worker_init_fn,
     )
     return train_loader, val_loader

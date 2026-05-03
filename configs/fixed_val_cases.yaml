@@ -1,0 +1,97 @@
+fixed_val_cases:
+  - patient_id: 2ABD093
+    region: AB
+    slices:
+      - 14
+      - 15
+      - 16
+  - patient_id: 2ABD095
+    region: AB
+    slices:
+      - 63
+      - 64
+      - 65
+  - patient_id: 2ABD096
+    region: AB
+    slices:
+      - 79
+      - 80
+      - 81
+  - patient_id: 2ABD098
+    region: AB
+    slices:
+      - 50
+      - 52
+      - 58
+  - patient_id: 2BB171
+    region: BB
+    slices:
+      - 83
+      - 84
+      - 85
+  - patient_id: 2BB173
+    region: BB
+    slices:
+      - 74
+      - 75
+      - 76
+  - patient_id: 2BB175
+    region: BB
+    slices:
+      - 129
+      - 130
+      - 131
+  - patient_id: 2BB177
+    region: BB
+    slices:
+      - 80
+      - 81
+      - 83
+  - patient_id: 2HND080
+    region: HN
+    slices:
+      - 2
+      - 3
+      - 4
+  - patient_id: 2HND081
+    region: HN
+    slices:
+      - 2
+      - 3
+      - 4
+  - patient_id: 2HND082
+    region: HN
+    slices:
+      - 0
+      - 1
+      - 2
+  - patient_id: 2HND083
+    region: HN
+    slices:
+      - 5
+      - 6
+      - 8
+  - patient_id: 2THD105
+    region: TH
+    slices:
+      - 66
+      - 67
+      - 69
+  - patient_id: 2THD106
+    region: TH
+    slices:
+      - 8
+      - 9
+      - 10
+  - patient_id: 2THD107
+    region: TH
+    slices:
+      - 8
+      - 9
+      - 10
+  - patient_id: 2THD108
+    region: TH
+    slices:
+      - 19
+      - 20
+      - 65
