@@ -2,6 +2,8 @@
 
 > 数据来源：synthRAD2023 Task2 (Brain) + synthRAD2025 Task2 (AB / HN / TH)
 
+> 主实验矩阵、训练轮数和验收指标见 `SPEC_experiments.md`。
+
 ---
 
 ## 当前实现状态（2026-05-03）

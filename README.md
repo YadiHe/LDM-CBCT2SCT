@@ -14,6 +14,7 @@
 
 - `SPEC_preprocessing.md`：预处理 SPEC
 - `SPEC_pipeline.md`：数据、VAE、Phase 1 训练和调试记录
+- `SPEC_experiments.md`：主实验矩阵、训练轮数和验收指标
 - `scripts/README.md`：当前脚本入口说明
 
 ## 当前主入口
