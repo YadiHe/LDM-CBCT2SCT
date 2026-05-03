@@ -188,6 +188,32 @@ def _to_image01(x_norm):
     return ((x_norm + 1.0) * 0.5).clamp(0.0, 1.0)
 
 
+def _add_panel_label(image, label):
+    out = np.repeat(image[..., None], 3, axis=2) if image.ndim == 2 else image.copy()
+    out[:18, :, :] = 0.0
+    try:
+        from PIL import Image, ImageDraw
+        pil = Image.fromarray((out * 255).astype(np.uint8))
+        draw = ImageDraw.Draw(pil)
+        draw.text((4, 3), label, fill=(255, 255, 255))
+        out = np.asarray(pil).astype(np.float32) / 255.0
+    except Exception:
+        label_width = min(len(label) * 6 + 8, out.shape[1])
+        out[2:16, 2:label_width, :] = 1.0
+    return out
+
+
+def _make_comparison_panel(cbct, ct, sct, error):
+    panels = [
+        _add_panel_label(cbct, "CBCT"),
+        _add_panel_label(ct, "CT"),
+        _add_panel_label(sct, "sCT"),
+        _add_panel_label(error, "|err|"),
+    ]
+    separator = np.ones((panels[0].shape[0], 3, 3), dtype=panels[0].dtype)
+    return np.concatenate([panels[0], separator, panels[1], separator, panels[2], separator, panels[3]], axis=1)
+
+
 def _encode_vae(vae, x, latent_mode="mu"):
     mu, logvar = vae.encode(x)
     if latent_mode == "sample":
@@ -321,10 +347,13 @@ def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, dif
     err = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).clamp(0, 300) / 300.0
     for i in range(ct_img.size(0)):
         caption = captions[i] if captions else f"sample_{i}"
-        wandb_logger.log_image(f"fixed_val/ct_{i}", _to_image01(ct_img[i]).squeeze().cpu().numpy(), caption, step=epoch)
-        wandb_logger.log_image(f"fixed_val/cbct_{i}", _to_image01(cbct_img[i]).squeeze().cpu().numpy(), caption, step=epoch)
-        wandb_logger.log_image(f"fixed_val/sct_{i}", _to_image01(sct[i]).squeeze().cpu().numpy(), caption, step=epoch)
-        wandb_logger.log_image(f"fixed_val/error_{i}", err[i].squeeze().cpu().numpy(), caption, step=epoch)
+        panel = _make_comparison_panel(
+            _to_image01(cbct_img[i]).squeeze().cpu().numpy(),
+            _to_image01(ct_img[i]).squeeze().cpu().numpy(),
+            _to_image01(sct[i]).squeeze().cpu().numpy(),
+            err[i].squeeze().cpu().numpy(),
+        )
+        wandb_logger.log_image(f"fixed_val/comparison_{i}", panel, caption, step=epoch)
 
 
 def train_unet_concat_control_paca(

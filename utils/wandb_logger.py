@@ -51,6 +51,9 @@ class WandbLogger:
         """
         self.enabled = enabled and HAS_WANDB
         self.run = None
+        self._loss_epochs = []
+        self._train_losses = []
+        self._val_losses = []
 
         if not self.enabled:
             print("📊 WandB logging disabled")
@@ -120,6 +123,8 @@ class WandbLogger:
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "train/loss_total": train_loss,
+            "val/loss_total": val_loss,
             "loss_gap": val_loss - train_loss,  # 正值表示可能过拟合
             "loss_ratio": val_loss / train_loss if train_loss > 0 else 0,
         }
@@ -129,6 +134,17 @@ class WandbLogger:
 
         if extra_metrics:
             metrics.update(extra_metrics)
+
+        self._loss_epochs.append(epoch)
+        self._train_losses.append(train_loss)
+        self._val_losses.append(val_loss)
+        metrics["loss/train_val_total"] = wandb.plot.line_series(
+            xs=self._loss_epochs,
+            ys=[self._train_losses, self._val_losses],
+            keys=["train_loss", "val_loss"],
+            title="Total Train Loss vs Val Loss",
+            xname="epoch",
+        )
 
         wandb.log(metrics, step=epoch)
 
