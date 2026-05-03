@@ -126,7 +126,7 @@ CLI 等价：
 - 建立最小可靠 baseline；后续所有增强模块都必须和 A0 比较
 - 确认仅靠 CBCT latent concat + region embedding 能否生成可用 sCT
 
-### B 系列：DR feature 作为 ControlNet 输入
+### B 系列：ControlNet 条件源 = DR feature
 
 ```text
 B1 = A0 + DR + ControlNet residual add, γ=0.5
@@ -148,32 +148,27 @@ B2 = A0 + DR + ControlNet residual add, γ=1.0
 - **B1 vs B2**：差距 < 上述阈值视为持平，优先选更稳定的 γ=0.5
 - **B 全部劣于 A0**：DR source 不进入 D1
 
-### C 系列：CBCT latent adapter + ControlNet / PACA 融合
+### C 系列：ControlNet 条件源 = CBCT latent adapter
+
+C 不启用 DR，ControlNet 输入由 "VAE-encoded CBCT latent + 1×1 ZeroConv adapter" 提供（adapter 通道 `3→base_channels`，参数归入 ControlNet）。在此前提下枚举 fusion 方式：
 
 ```text
-C1 = A0 + ControlNet using CBCT latent adapter (residual add only)
-C2 = A0 + ControlNet using CBCT latent adapter (PACA only)
-C3 = A0 + ControlNet using CBCT latent adapter (residual add + PACA)
+C1 = A0 + ControlNet (residual add only)
+C2 = A0 + ControlNet (PACA only)
+C3 = A0 + ControlNet (residual add + PACA)
 ```
 
 `--use-dr=False --use-controlnet=True --control-source=cbct_latent --controlnet-fusion {add, paca, both}`
-
-注意：C 系列不启用 DR，因此 ControlNet 输入由 "VAE-encoded CBCT latent + 1×1 ZeroConv adapter" 提供，不是 DR 输出。adapter 通道为 `3→base_channels`，参数量归入 ControlNet。
 
 C1 / C2 / C3 **统一跑 50 epoch**，避免不公平比较（旧版给 C3 30 epoch 是错的）。
 
 判断（量化）：
 
 - C1 / C2 / C3 之间差距 < 5 HU MAE 视为持平，选最简单的（C1 < C2 < C3）
-- C 全部劣于 A0：ControlNet/PACA 不进入 D1
+- C 全部劣于 A0：ControlNet 路径不进入 D1
 - C 中至少一个优于 A0 ≥ 5 HU MAE：保留最优融合方式
 
-B 与 C 的核心对比：
-
-- B：ControlNet 条件来自 DR feature，同时有 DR auxiliary loss
-- C：ControlNet 条件来自 CBCT latent adapter，无 DR auxiliary loss
-
-因此 B/C 共同回答 "ControlNet 条件源选 DR feature 还是 CBCT latent adapter"，C 组内部再回答 "residual add / PACA / both 哪种融合更合适"。
+B 与 C 的核心对比：B 用 DR feature 作为 ControlNet 条件并附加 DR aux loss；C 用 CBCT latent adapter 作为 ControlNet 条件且无 aux loss。两组共同回答 "ControlNet 条件源选哪个"，C 内部再回答 "fusion 选哪种"。
 
 ### D1：最终主模型
 
@@ -191,10 +186,6 @@ D1 = A0 + best ControlNet source + best fusion + best γ if source=DR
 - B 和 C 系列全部完成 ≥ 50 epoch 且 fixed val 图像已上传
 - 确定 best ControlNet source、best fusion、以及 DR source 是否值得保留
 - 启动 D1 长训前在 wandb 写一条 note 说明组合选择依据
-
-### 交互假设
-
-本矩阵不完整展开 `control-source × fusion × gamma`。默认先用 B 评估 DR source，用 C 评估 CBCT latent source 下的 fusion。如果最终 D1 的选择需要跨源复用 fusion（例如 C2 的 PACA only 很强，但 B2 的 DR source 也很强），则补 1 个交叉点再长训，而不是直接假设组合最优。
 
 ---
 
@@ -294,9 +285,10 @@ wandb 指标见 §2.2 / §2.3，所有 run 必须完整。
 1. **VAE 不重训**：当前 `vae_best.pth` 基于旧 train=199 split 训练；val 23 例不变，val 指标可横向比较。Phase 1 完成前不重训。
 2. **Latent 用 mu，不用 sample**：节省一次随机采样，且 mu 在 reconstruction 任务上更稳定，不做消融。
 3. **Region embedding 始终开启**：不做消融，相关价值参考已有 prior 工作。
-4. **不全量展开交互**：见 §三末尾，不跑完整 `control-source × fusion × gamma` 笛卡尔积；必要时只补关键交叉点。
-5. **不切 held-out test**：盲提交集（官方 val zip 42 例）由 D1 完成后单独写 inference 脚本。
-6. **Phase 2 全局引导**：不在本矩阵内。仅当 D1 在 AB / TH 出现明显全局上下文缺失时再考虑。
+4. **不全量展开 `control-source × fusion × gamma`**：B 固定 fusion=residual add，C 固定无 DR 后枚举 fusion；γ 仅在 B 内部消融。不跑完整笛卡尔积。
+5. **DR source × {PACA, both} 暂不测（待验证）**：假设 fusion 的相对优劣对两条件源一致——即如果 C 内部 add 最优，DR source 上也用 add。**触发补测条件**：若 C2 或 C3 比 C1 优 ≥ 5 HU MAE 且 B 也优于 A0，则在 D1 长训前补 1 个 `DR + best-C-fusion` 交叉点确认；否则不补。本条目的存在是为了在结果出来后不忘记这个盲点，而不是预先排 run。
+6. **不切 held-out test**：盲提交集（官方 val zip 42 例）由 D1 完成后单独写 inference 脚本。
+7. **Phase 2 全局引导**：不在本矩阵内。仅当 D1 在 AB / TH 出现明显全局上下文缺失时再考虑。
 
 ---
 
