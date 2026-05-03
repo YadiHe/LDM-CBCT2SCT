@@ -18,6 +18,7 @@
   - `2ABD100` ConcatPACA 小模型 overfit 5 epoch：val loss 0.310 → 0.100。
   - `2ABD001` VAE 小样本 overfit 5 epoch：loss 0.350 → 0.083。
 - `scripts/train_concat_paca.py` 已接入 WandB，默认上传；使用 `--no-wandb` 可关闭。Phase 1 小规模训练验证已完成，loss 可正常下降。
+- `scripts/` 根目录只保留当前主流程入口：`preprocess_synthrad_dataset.py`、`train_ct_vae.py`、`train_concat_paca.py`；旧实验/推理/评估/制图脚本已归档到 `scripts/legacy/`。
 
 ---
 
