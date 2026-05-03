@@ -59,8 +59,9 @@ def parse_args():
                    help="disable training augmentation (flip + rotation)")
 
     # Model
-    p.add_argument("--base-channels", type=int, default=256,
-                   help="base channel width for UNet and ControlNet (default 256 → 613M params)")
+    p.add_argument("--base-channels", type=int, default=64,
+                   help="base channel width for UNet and ControlNet "
+                        "(default 64 → ~31M trainable; 128 → ~124M; 256 → ~497M)")
 
     # Training
     p.add_argument("--epochs",         type=int,   default=300)

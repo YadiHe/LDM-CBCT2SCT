@@ -10,8 +10,8 @@
 
 - 预处理主线已实现于 `scripts/preprocess_synthrad_dataset.py`：SimpleITK 明确加载为 `(1, Z, H, W)`，MONAI `Compose` + `MapTransform` 负责同步 clip / crop / resize / pad / normalize。
 - 本地 rawdata 训练 zip 已全量预处理完成：`data/preprocessed/` 9.2 GB，`data/manifest.csv` 241 例。
-- 当前 zip 内训练病例数实测为 241 例，不是早期记录的 245 例：BB 60 / AB 53 / HN 65 / TH 63。
-- `manifest.csv` 当前患者级划分：train 199 / val 23 / test 19。
+- 当前 zip 内训练病例数实测为 241 例：BB 60 / AB 53 / HN 65 / TH 63。早期 SPEC 写的 245 是把每个 region 内的 `overview(s)/` 缩略图目录一起算了，那些目录里没有医学图像，`find_patients` 自动跳过。
+- `manifest.csv` 当前患者级划分：train 218 / val 23（不再切 test 集）。官方 val zip（仅 cbct + mask，无 CT GT）单独保留用于 Phase 1 长训完成后的定性推理 / 挑战赛盲提交，不在 manifest 内。
 - VAE 已完成全量训练验证：`checkpoints/vae/vae_best.pth` 在完整 val 集 2487 slices / 156 batches 上 `val_loss=0.252599`，无 NaN。
 - VAE 架构形状已用真实 batch 验证：`(B,1,256,256) → (B,3,64,64) → (B,1,256,256)`。
 - `scripts/train_ct_vae.py` 已添加 `--eval-only`，可加载任意 VAE checkpoint 跑完整 val 并上传固定 val batch 可视化。
@@ -28,15 +28,15 @@
 
 ### 1.1 数据量
 
-| 数据集 | 部位 | Spec 记录训练集 | 当前 zip 实测训练集 | 官方验证集（无 GT） |
-|--------|------|----------------|--------------------|------------------|
-| synthRAD2023 | Brain (BB) | 61 例 | **60 例** | 11 例 |
-| synthRAD2025 | Abdomen (AB) | 54 例 | **53 例** | 9 例 |
-| synthRAD2025 | Head & Neck (HN) | 66 例 | **65 例** | 11 例 |
-| synthRAD2025 | Thorax (TH) | 64 例 | **63 例** | 11 例 |
-| **合计** | | **245 例** | **241 例** | **42 例（提交用）** |
+| 数据集 | 部位 | 训练 zip（含 CT GT） | 官方验证集（无 CT GT） |
+|--------|------|--------------------|----------------------|
+| synthRAD2023 | Brain (BB) | **60 例** | 11 例 |
+| synthRAD2025 | Abdomen (AB) | **53 例** | 9 例 |
+| synthRAD2025 | Head & Neck (HN) | **65 例** | 11 例 |
+| synthRAD2025 | Thorax (TH) | **63 例** | 11 例 |
+| **合计** | | **241 例** | **42 例（提交用）** |
 
-官方验证集仅含 CBCT + mask，无 CT ground truth，单独保留用于挑战赛提交。
+官方验证集仅含 CBCT + mask，无 CT ground truth；当前预处理脚本不读它，留作 Phase 1 长训完成后的定性推理 / 挑战赛盲提交。
 
 ### 1.2 文件格式
 
@@ -63,17 +63,21 @@ Mask 为二值 body mask（前景约 42–50%）。
 
 | 部位 | crop 后 max(H,W) | scale → 256 | 有效分辨率 |
 |------|----------------|-------------|----------|
-| Brain | 222–244 | 1.05–1.15 | 1.0 mm/px |
+| Brain | 222–239 | 1.07–1.15 | 1.0 mm/px |
 | HN | 278–281 | 0.91–0.92 | 1.1 mm/px |
 | AB | 290–419 | 0.61–0.88 | 1.6 mm/px |
 | TH | 391–498 | 0.51–0.65 | 1.9 mm/px |
+
+注：mask bbox 加 10 px margin 后被原始边界 clamp 住，所以 max(H,W) ≤ 原始 XY 上限（Brain 原始 ≤239）。
 
 ### 1.5 HU 强度分析（实测）
 
 | 部位 | 模态 | p5 | p50 | p95 | p99 | max |
 |------|------|-----|-----|-----|-----|-----|
-| Brain | CT | – | – | – | – | 3000 |
-| Brain | CBCT | – | – | – | – | 2000 |
+| Brain | CT | n/a | n/a | n/a | n/a | ~3000 |
+| Brain | CBCT | n/a | n/a | n/a | n/a | ~2000 |
+
+> Brain 行 p5/p50/p95/p99 当前未测；max 来自抽查，足够确认 1500 HU clip 上限可消除金属伪影。
 | AB | CT | -1000 | -1000 | 41 | 84 | 3069 |
 | AB | CBCT | -1000 | -1000 | -41 | 39 | 548 |
 | TH | CT | -1000 | -1000 | 72 | 343 | 1530 |
@@ -251,24 +255,27 @@ restore_preprocessed_to_original(arr, preprocess_meta)
 
 ```
 patient_id, region, split, ct_path, cbct_path, mask_path, cbct_global_path, preprocess_meta_path
-2ABD100, AB, train, data/preprocessed/2ABD100/ct_preprocessed.mha, ..., data/preprocessed/2ABD100/preprocess_metadata.json
+2ABD100, AB, train, /abs/path/to/data/preprocessed/2ABD100/ct_preprocessed.mha, ...
 ```
 
 - `region`：BB / AB / HN / TH（用于 region embedding）
 - `cbct_global_path`：整体缩放的全局 CBCT volume，当前仅作为可选增强备用
 - `preprocess_meta_path`：反向映射和 QC 使用
+- 路径目前是**绝对路径**（`scripts/preprocess_synthrad_dataset.py:474` 用 `os.path.abspath`），跨机器迁移需重生成 manifest 或写一个相对化转换
 
 ### 2.6 数据划分（患者级）
 
-当前本地 zip 实测划分：
+患者按 ID 字母序排序后切分：每个 region 前 `n_train_first` 例 → train，紧接 `n_val` 例 → val，剩余的尾部继续归入 train。**当前不切 held-out test 集**——所有带 CT GT 的 241 例全部用于训练或 val。挑战赛盲提交集（官方 val zip 42 例，无 CT GT）由 Phase 1 长训完成后单独写一个 inference 脚本处理，不在 manifest 内。
 
-| 部位 | 训练 | 验证 | 测试 | 合计 |
-|------|------|------|------|------|
-| Brain (BB) | 49 | 6 | 5 | 60 |
-| AB | 44 | 5 | 4 | 53 |
-| HN | 54 | 6 | 5 | 65 |
-| TH | 52 | 6 | 5 | 63 |
-| **合计** | **199** | **23** | **19** | **241** |
+| 部位 | 训练 | 验证 | 合计 |
+|------|------|------|------|
+| Brain (BB) | 54 | 6 | 60 |
+| AB | 48 | 5 | 53 |
+| HN | 59 | 6 | 65 |
+| TH | 57 | 6 | 63 |
+| **合计** | **218** | **23** | **241** |
+
+`SPLIT_COUNTS` (`scripts/preprocess_synthrad_dataset.py`) 现在是 2-tuple `(n_train_first, n_val)`：BB=(49,6)、AB=(44,5)、HN=(54,6)、TH=(52,6)，"前 49 + 后 5" 都归 train，与 VAE/Phase 1 已用过的 23 例 val 完全一致——VAE val_loss=0.2526 仍然有效，无需重训。
 
 ---
 
@@ -360,13 +367,17 @@ L = MSE(pred_noise, noise) + γ × [L1(pred_128, gt_128) + L1(pred_64, gt_64)]
 
 ### 4.2 各组件说明
 
-| 组件 | 参数量 | 作用 |
-|------|--------|------|
-| VAE | ~30M（**冻结**）| 图像 ↔ latent 压缩（仅用 CT 训练）|
-| DegradationRemoval | ~0.3M | 像素空间 CBCT 降质建模，输出 64×64×256 特征 + 多尺度辅助预测 |
-| ControlNet | ~184M | 复制 UNet 编码器结构，ZeroConv 注入结构化残差 |
-| UNetConcatControlPACA | ~429M | 主去噪 UNet，concat 条件输入，PACA 层融合 ControlNet 残差 |
-| **可训练合计** | **~613M** | |
+参数量随 `--base-channels` 变化（实测，不再使用旧的 ~613M 估算）：
+
+| 组件 | base=64 | base=128 | base=256 | 作用 |
+|------|--------:|---------:|---------:|------|
+| VAE | 9.5M（冻结） | 9.5M（冻结） | 9.5M（冻结） | 图像 ↔ latent 压缩（仅用 CT 训练） |
+| DegradationRemoval | 0.10M | 0.16M | 0.27M | 像素空间 CBCT 降质建模，输出 base ch ×64×64 特征 + 多尺度辅助预测 |
+| ControlNet | 11.3M | 45.0M | 179.9M | 复制 UNet 编码器结构，ZeroConv 注入结构化残差 |
+| UNetConcatControlPACA | 19.9M | 79.4M | 317.2M | 主去噪 UNet，concat 条件输入，PACA 层融合 ControlNet 残差 |
+| **可训练合计** | **~31M** | **~125M** | **~497M** | |
+
+`scripts/train_concat_paca.py --base-channels` 默认 64（与 §4.3 推荐一致）。
 
 **DR 模块的价值**：在 latent 空间操作之前，先在像素空间显式学习 CBCT 到 CT 的降质映射，相当于给 ControlNet 提供了一个"预清洁"的 CBCT 特征，对多部位的不同伪影模式尤为有效。
 
@@ -530,7 +541,9 @@ python scripts/train_concat_paca.py \
   --manifest data/manifest.csv \
   --vae-path checkpoints/vae/vae_best.pth \
   --save-dir checkpoints/concat_paca \
-  --batch-size 16 \
+  --base-channels 64 \
+  --batch-size 8 \
+  --grad-accum-steps 2 \
   --epochs 300 \
   --lr 5e-6 \
   --wandb-project cbct2sct_IBA
@@ -590,8 +603,8 @@ self.region_embedding = nn.Embedding(4, time_emb_dim)
 
 # forward 中（time_emb 计算之后）
 t_emb = self.time_mlp(t)
-r_emb = self.region_embedding(region_id)   # region_id: (B,) int
-t_emb = t_emb + r_emb                      # 相加，形状不变
+if region_id is not None:                  # 训练总是传，inference 兼容历史 ckpt
+    t_emb = t_emb + self.region_embedding(region_id)
 ```
 
 ### 6.2 训练循环：更新 DataLoader 解包

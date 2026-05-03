@@ -58,12 +58,16 @@ REGION_PREFIXES = [
     ("2BB",  "BB"),
 ]
 
-# Exact train/val/test counts per region (from dataset analysis)
+# Per-region (n_train_first, n_val) counts. Patients are sorted alphabetically;
+# the first n_train_first go to train, the next n_val to val, and any remainder
+# also goes to train. Region totals: BB=60, AB=53, HN=65, TH=63 → 218 train + 23 val.
+# The official challenge val zip (no CT GT) is not handled by this script and is
+# reserved for post-training inference / submission.
 SPLIT_COUNTS = {
-    "BB": (49, 6, 6),
-    "AB": (44, 5, 5),
-    "HN": (54, 6, 6),
-    "TH": (52, 6, 6),
+    "BB": (49, 6),
+    "AB": (44, 5),
+    "HN": (54, 6),
+    "TH": (52, 6),
 }
 
 
@@ -433,23 +437,21 @@ def preprocess(patient_paths: dict, original_geometry: dict):
 
 def assign_splits(by_region: dict) -> list:
     """
-    Sort patients per region alphabetically, assign deterministic train/val/test splits.
-    Returns list of dicts with keys: patient_id, region, split, _dir
+    Sort patients per region alphabetically and assign deterministic train/val splits.
+
+    Indices [0, n_tr) → train, [n_tr, n_tr+n_vl) → val, [n_tr+n_vl, end) → train.
+    The trailing-train segment absorbs whatever remains after train+val so that no
+    GT-bearing patient is dropped. Returns list of dicts with keys:
+    patient_id, region, split, _dir
     """
     rows = []
     for region, pats in sorted(by_region.items()):
         pats = sorted(pats, key=lambda x: x[0])
-        n_tr, n_vl, n_te = SPLIT_COUNTS[region]
-        expected = n_tr + n_vl + n_te
-        if len(pats) < expected:
-            print(f"  [warn] {region}: found {len(pats)} patients, expected ≥{expected}")
-        for i, (pid, pdir) in enumerate(pats[:expected]):
-            if i < n_tr:
-                split = "train"
-            elif i < n_tr + n_vl:
-                split = "val"
-            else:
-                split = "test"
+        n_tr, n_vl = SPLIT_COUNTS[region]
+        if len(pats) < n_tr + n_vl:
+            print(f"  [warn] {region}: found {len(pats)} patients, expected ≥{n_tr + n_vl}")
+        for i, (pid, pdir) in enumerate(pats):
+            split = "val" if (n_tr <= i < n_tr + n_vl) else "train"
             rows.append({"patient_id": pid, "region": region, "split": split, "_dir": pdir})
     return rows
 
