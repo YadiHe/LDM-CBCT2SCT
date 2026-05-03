@@ -11,6 +11,7 @@
         --vae-path  checkpoints/vae/vae_best.pth \
         --save-dir  checkpoints/concat_paca \
         --batch-size 16 \
+        --grad-accum-steps 1 \
         --epochs 300 \
         --lr 5e-6
 
@@ -66,6 +67,10 @@ def parse_args():
     p.add_argument("--lr",             type=float, default=5e-6)
     p.add_argument("--gamma",          type=float, default=1.0,
                    help="weight for DR auxiliary loss: total = L_diff + gamma * L_dr")
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="number of micro-batches to accumulate before optimizer.step()")
+    p.add_argument("--no-amp", action="store_true",
+                   help="disable CUDA AMP autocast and GradScaler")
     p.add_argument("--early-stopping", type=int,   default=50,
                    help="stop if val loss doesn't improve for this many epochs")
     p.add_argument("--max-train-batches", type=int, default=None,
@@ -163,7 +168,11 @@ def main():
     os.makedirs(predict_dir, exist_ok=True)
 
     print(f"\nCheckpoints → {save_dir}")
-    print(f"Epochs: {args.epochs}  LR: {args.lr}  gamma: {args.gamma}  early-stop: {args.early_stopping}")
+    print(
+        f"Epochs: {args.epochs}  LR: {args.lr}  gamma: {args.gamma}  "
+        f"grad-accum: {args.grad_accum_steps}  AMP: {'off' if args.no_amp else 'on'}  "
+        f"early-stop: {args.early_stopping}"
+    )
     print("=" * 60 + "\n")
 
     wandb_logger = None
@@ -183,6 +192,8 @@ def main():
                 "epochs": args.epochs,
                 "lr": args.lr,
                 "gamma": args.gamma,
+                "grad_accum_steps": args.grad_accum_steps,
+                "amp": not args.no_amp,
                 "early_stopping": args.early_stopping,
                 "max_train_batches": args.max_train_batches,
                 "max_val_batches": args.max_val_batches,
@@ -210,6 +221,8 @@ def main():
             wandb_logger=wandb_logger,
             max_train_batches=args.max_train_batches,
             max_val_batches=args.max_val_batches,
+            grad_accum_steps=args.grad_accum_steps,
+            amp_enabled=torch.cuda.is_available() and not args.no_amp,
         )
     finally:
         if wandb_logger:

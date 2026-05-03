@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torchvision
 import matplotlib.pyplot as plt
 import numpy as np
+from torch.cuda.amp import autocast, GradScaler
 
 from models.diffusion import Diffusion
 from models.blocks import ControlNetPACAUpBlock, nonlinearity, Normalize, TimestepEmbedding, DownBlock, MiddleBlock, ConditionalUpBlock, UpBlock, PACALayer
@@ -172,12 +173,17 @@ def train_unet_concat_control_paca(
     wandb_logger=None,
     max_train_batches=None,
     max_val_batches=None,
+    grad_accum_steps=1,
+    amp_enabled=None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(predict_dir, exist_ok=True)
-    amp_enabled = torch.cuda.is_available()
+    if amp_enabled is None:
+        amp_enabled = torch.cuda.is_available()
+    grad_accum_steps = max(int(grad_accum_steps), 1)
     print(f"AMP Enabled: {amp_enabled}")
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
     vae.to(device)
     unet.to(device)
     controlnet.to(device)
@@ -202,6 +208,7 @@ def train_unet_concat_control_paca(
     print(f"Total parameters to train:          {total_param_count}")
     
     optimizer = torch.optim.AdamW(params_to_train, lr=learning_rate) # Use AdamW
+    scaler = GradScaler(enabled=amp_enabled)
     if patience is None:
         patience = epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -218,8 +225,6 @@ def train_unet_concat_control_paca(
     best_val_loss = float('inf')
     early_stopping_counter = 0
 
-    optimizer.zero_grad()
-
     for epoch in range(epochs):
         unet.train()
         controlnet.train()
@@ -227,6 +232,10 @@ def train_unet_concat_control_paca(
         train_loss_total = 0
         train_loss_diff = 0
         train_loss_dr = 0
+        train_batches = min(len(train_loader), max_train_batches) if max_train_batches is not None else len(train_loader)
+        optimizer_steps = 0
+
+        optimizer.zero_grad(set_to_none=True)
 
         for i, (ct_img, cbct_img, mask, region_id) in enumerate(train_loader):
             if max_train_batches is not None and i >= max_train_batches:
@@ -236,39 +245,45 @@ def train_unet_concat_control_paca(
             mask      = mask.to(device)
             region_id = region_id.to(device)
 
-            optimizer.zero_grad()
-
             with torch.no_grad():
-                ct_mu, ct_logvar = vae.encode(ct_img)
-                z_ct = vae.reparameterize(ct_mu, ct_logvar)
+                with autocast(enabled=amp_enabled):
+                    ct_mu, ct_logvar = vae.encode(ct_img)
+                    z_ct = vae.reparameterize(ct_mu, ct_logvar)
 
-                cbct_z_mu, cbct_z_logvar = vae.encode(cbct_img)
-                cbct_z = vae.reparameterize(cbct_z_mu, cbct_z_logvar)
+                    cbct_z_mu, cbct_z_logvar = vae.encode(cbct_img)
+                    cbct_z = vae.reparameterize(cbct_z_mu, cbct_z_logvar)
 
             # Forward pass
-            controlnet_input, intermediate_preds = dr_module(cbct_img)
-            t = diffusion.sample_timesteps(z_ct.size(0))
-            noise = torch.randn_like(z_ct)
-            z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
-            down_res_samples, middle_res_sample = controlnet(z_noisy_ct, controlnet_input, t)
-            pred_noise = unet(z_noisy_ct, cbct_z, t, down_res_samples, middle_res_sample, region_id=region_id)
+            with autocast(enabled=amp_enabled):
+                controlnet_input, intermediate_preds = dr_module(cbct_img)
+                t = diffusion.sample_timesteps(z_ct.size(0))
+                noise = torch.randn_like(z_ct)
+                z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
+                down_res_samples, middle_res_sample = controlnet(z_noisy_ct, controlnet_input, t)
+                pred_noise = unet(z_noisy_ct, cbct_z, t, down_res_samples, middle_res_sample, region_id=region_id)
 
-            # Mask-weighted diffusion loss: exclude padding (air) regions
-            latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-            loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
-            loss_dr = degradation_loss(intermediate_preds, ct_img, mask)
-            total_loss = loss_diff + gamma * loss_dr
+                # Mask-weighted diffusion loss: exclude padding (air) regions
+                latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
+                loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
+                loss_dr = degradation_loss(intermediate_preds, ct_img, mask)
+                total_loss = loss_diff + gamma * loss_dr
+                scaled_loss = total_loss / grad_accum_steps
 
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(params_to_train, max_norm=1.0)
+            scaler.scale(scaled_loss).backward()
 
-            optimizer.step()
+            should_step = ((i + 1) % grad_accum_steps == 0) or ((i + 1) == train_batches)
+            if should_step:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params_to_train, max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
 
             train_loss_total += total_loss.item()
             train_loss_diff += loss_diff.item()
             train_loss_dr += loss_dr.item()
             
-        train_batches = min(len(train_loader), max_train_batches) if max_train_batches is not None else len(train_loader)
         avg_train_loss_total = train_loss_total / train_batches
         avg_train_loss_diff = train_loss_diff / train_batches
         avg_train_loss_dr = train_loss_dr / train_batches
@@ -292,31 +307,32 @@ def train_unet_concat_control_paca(
                 mask      = mask.to(device)
                 region_id = region_id.to(device)
 
-                ct_mu, ct_logvar = vae.encode(ct_img)
-                z_ct = vae.reparameterize(ct_mu, ct_logvar)
+                with autocast(enabled=amp_enabled):
+                    ct_mu, ct_logvar = vae.encode(ct_img)
+                    z_ct = vae.reparameterize(ct_mu, ct_logvar)
 
-                cbct_z_mu, cbct_z_logvar = vae.encode(cbct_img)
-                cbct_z = vae.reparameterize(cbct_z_mu, cbct_z_logvar)
+                    cbct_z_mu, cbct_z_logvar = vae.encode(cbct_img)
+                    cbct_z = vae.reparameterize(cbct_z_mu, cbct_z_logvar)
 
-                controlnet_input, intermediate_preds = dr_module(cbct_img)
+                    controlnet_input, intermediate_preds = dr_module(cbct_img)
 
-                loss_dr = degradation_loss(intermediate_preds, ct_img, mask)
+                    loss_dr = degradation_loss(intermediate_preds, ct_img, mask)
 
-                t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
-                noise = torch.randn(
-                    z_ct.shape,
-                    device=z_ct.device,
-                    dtype=z_ct.dtype,
-                    generator=val_generator
-                )
-                z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
+                    t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
+                    noise = torch.randn(
+                        z_ct.shape,
+                        device=z_ct.device,
+                        dtype=z_ct.dtype,
+                        generator=val_generator
+                    )
+                    z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
 
-                down_res_samples, middle_res_sample = controlnet(z_noisy_ct, controlnet_input, t)
-                pred_noise = unet(z_noisy_ct, cbct_z, t, down_res_samples, middle_res_sample, region_id=region_id)
+                    down_res_samples, middle_res_sample = controlnet(z_noisy_ct, controlnet_input, t)
+                    pred_noise = unet(z_noisy_ct, cbct_z, t, down_res_samples, middle_res_sample, region_id=region_id)
 
-                latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
-                total_loss = loss_diff + gamma * loss_dr
+                    latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
+                    loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
+                    total_loss = loss_diff + gamma * loss_dr
 
                 val_loss_total += total_loss.item()
                 val_loss_diff += loss_diff.item()
@@ -346,6 +362,8 @@ def train_unet_concat_control_paca(
                     "val/loss_dr": avg_val_loss_dr,
                     "train/batches": train_batches,
                     "val/batches": val_batches,
+                    "train/optimizer_steps": optimizer_steps,
+                    "train/grad_accum_steps": grad_accum_steps,
                 },
             )
         
