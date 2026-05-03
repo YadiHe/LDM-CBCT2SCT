@@ -97,6 +97,41 @@ def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, m
         wandb_logger.log_image(f"{prefix}_visual/error_{i}", error, caption=f"epoch {epoch} {prefix} absolute error", step=epoch)
 
 
+def validate_vae(vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_enabled):
+    vae.eval()
+    val_total = 0.0
+    val_parts = {}
+    val_batches = 0
+    with torch.no_grad():
+        for i, x in enumerate(val_loader):
+            if args.max_val_batches is not None and i >= args.max_val_batches:
+                break
+            x = x.to(device, non_blocking=True)
+            with autocast(enabled=amp_enabled):
+                _, mu, logvar, recon = vae(x)
+                loss, parts = vae_loss_components(
+                    recon,
+                    x,
+                    mu,
+                    logvar,
+                    perceptual_loss,
+                    ssim_loss,
+                    args.perceptual_weight,
+                    args.ssim_weight,
+                    args.mse_weight,
+                    args.kl_weight,
+                    args.l1_weight,
+                )
+            val_total += loss.item()
+            for k, v in parts.items():
+                val_parts[k] = val_parts.get(k, 0.0) + v
+            val_batches += 1
+
+    avg_val = val_total / max(val_batches, 1)
+    val_metrics = {f"val/{k.split('/')[-1]}": v / max(val_batches, 1) for k, v in val_parts.items()}
+    return avg_val, val_metrics, val_batches
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train VAE on preprocessed CT slices")
     p.add_argument("--manifest", default="data/manifest.csv")
@@ -111,6 +146,8 @@ def parse_args():
     p.add_argument("--latent-channels", type=int, default=3)
     p.add_argument("--no-augment", action="store_true")
     p.add_argument("--resume", default=None)
+    p.add_argument("--eval-only", action="store_true",
+                   help="load --resume and run validation/visualization without training")
     p.add_argument("--start-epoch", type=int, default=0,
                    help="number of completed epochs when resuming; logging continues from start_epoch + 1")
     p.add_argument("--initial-best-val", type=float, default=None,
@@ -213,6 +250,42 @@ def main():
     print(f"Batch size   : {args.batch_size}")
     print(f"AMP enabled  : {amp_enabled}")
     print(f"Save dir     : {args.save_dir}")
+
+    if args.eval_only:
+        if not args.resume:
+            raise ValueError("--eval-only requires --resume")
+        avg_val, val_metrics, val_batches = validate_vae(
+            vae=vae,
+            val_loader=val_loader,
+            device=device,
+            perceptual_loss=perceptual_loss,
+            ssim_loss=ssim_loss,
+            args=args,
+            amp_enabled=amp_enabled,
+        )
+        print(f"Eval only | Val {avg_val:.6f} | batches {val_batches}")
+        if wandb_logger:
+            wandb_logger.log_metrics(
+                {
+                    "epoch": args.start_epoch,
+                    "val_loss": avg_val,
+                    "val/batches": val_batches,
+                    **val_metrics,
+                },
+                step=args.start_epoch,
+            )
+            log_vae_images(
+                vae=vae,
+                fixed_batch=fixed_val_batch,
+                device=device,
+                epoch=args.start_epoch,
+                wandb_logger=wandb_logger,
+                amp_enabled=amp_enabled,
+                max_samples=args.vis_num_samples,
+                prefix="val",
+            )
+            wandb_logger.finish()
+        return
 
     best_val = args.initial_best_val if args.initial_best_val is not None else float("inf")
     bad_epochs = 0
