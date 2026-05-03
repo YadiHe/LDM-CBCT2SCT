@@ -45,7 +45,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train UNetConcatControlPACA")
 
     # Required
-    p.add_argument("--manifest",  required=True, help="manifest CSV produced by preprocess_synthrad.py")
+    p.add_argument("--manifest",  required=True, help="manifest CSV produced by preprocess_synthrad_dataset.py")
     p.add_argument("--vae-path",  required=True, help="path to frozen VAE checkpoint (.pth)")
 
     # Output

@@ -6,7 +6,7 @@
 输出: data/preprocessed/{pid}/*.mha  +  manifest.csv
 
 用法:
-    python scripts/preprocess_synthrad.py \
+    python scripts/preprocess_synthrad_dataset.py \
         --raw-dir  rawdata/ \
         --out-dir  data/preprocessed \
         --manifest data/manifest.csv

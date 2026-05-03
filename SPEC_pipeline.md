@@ -6,13 +6,13 @@
 
 ## 当前实现状态（2026-05-03）
 
-- 预处理主线已实现于 `scripts/preprocess_synthrad.py`：SimpleITK 明确加载为 `(1, Z, H, W)`，MONAI `Compose` + `MapTransform` 负责同步 clip / crop / resize / pad / normalize。
+- 预处理主线已实现于 `scripts/preprocess_synthrad_dataset.py`：SimpleITK 明确加载为 `(1, Z, H, W)`，MONAI `Compose` + `MapTransform` 负责同步 clip / crop / resize / pad / normalize。
 - 本地 rawdata 训练 zip 已全量预处理完成：`data/preprocessed/` 9.2 GB，`data/manifest.csv` 241 例。
 - 当前 zip 内训练病例数实测为 241 例，不是早期记录的 245 例：BB 60 / AB 53 / HN 65 / TH 63。
 - `manifest.csv` 当前患者级划分：train 199 / val 23 / test 19。
 - VAE 已完成全量训练验证：`checkpoints/vae/vae_best.pth` 在完整 val 集 2487 slices / 156 batches 上 `val_loss=0.252599`，无 NaN。
 - VAE 架构形状已用真实 batch 验证：`(B,1,256,256) → (B,3,64,64) → (B,1,256,256)`。
-- `scripts/train_vae_preprocessed.py` 已添加 `--eval-only`，可加载任意 VAE checkpoint 跑完整 val 并上传固定 val batch 可视化。
+- `scripts/train_ct_vae.py` 已添加 `--eval-only`，可加载任意 VAE checkpoint 跑完整 val 并上传固定 val batch 可视化。
 - Phase 2 全局引导已降级为可选增强；当前不阻塞 Phase 1 baseline。
 - 真实小样本验证已完成：
   - `2ABD100` ConcatPACA 小模型 overfit 5 epoch：val loss 0.310 → 0.100。
@@ -546,7 +546,7 @@ python scripts/train_concat_paca.py \
 已提交 `--eval-only`，用于复核 VAE checkpoint，不进入训练循环：
 
 ```bash
-python scripts/train_vae_preprocessed.py \
+python scripts/train_ct_vae.py \
   --manifest data/manifest.csv \
   --save-dir checkpoints/vae_eval_best \
   --resume checkpoints/vae/vae_best.pth \

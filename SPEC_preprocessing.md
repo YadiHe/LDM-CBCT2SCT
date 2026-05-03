@@ -4,7 +4,7 @@
 
 ## 当前预处理结论
 
-- 主实现：`scripts/preprocess_synthrad.py`
+- 主实现：`scripts/preprocess_synthrad_dataset.py`
 - 处理框架：SimpleITK 加载 + MONAI `Compose` / `MapTransform`
 - 输入数据：synthRAD2023 Task2 Brain + synthRAD2025 Task2 AB / HN / TH
 - 输出目录：`data/preprocessed/`
