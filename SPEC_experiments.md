@@ -36,9 +36,9 @@
 | 实验 | 推荐 `batch_size` | `grad_accum_steps` | 备注 |
 |---|---|---|---|
 | A0 | 8 | 1 | 最小，无 ControlNet / DR |
-| B1 / B2 | 8 | 1 | DR 模块仅 0.10M，几乎不增显存 |
-| C1 / C2 / C3 | 4 | 2 | ControlNet 11.3M + PACA 反传激活，需要 accum |
-| D1（base_ch=64） | 4 | 2 | 同 C |
+| B1 / B2 | 4 | 2 | DR + ControlNet；DR feature 接入生成主干 |
+| C1 / C2 / C3 | 4 | 2 | CBCT latent adapter + ControlNet/PACA，需要 accum |
+| D1（base_ch=64） | 4 | 2 | 同 B/C |
 | D1（如升 base_ch=128） | 2 | 4 | 长训前再决定是否升 |
 
 每个 run 必须把实际 `batch_size` × `grad_accum_steps` 写到 wandb config，便于审计。
@@ -59,8 +59,8 @@
 
 执行 A0 / B / C / D1 之前**必须先合并**以下能力（见 §九）：
 
-- `train_concat_paca.py` 增加 `--use-dr / --use-controlnet / --controlnet-fusion {add,paca,both}` 模块开关
-- ControlNet 输入源切换：当 `--use-dr=False` 但 `--use-controlnet=True` 时，使用 VAE-encoded CBCT latent（3→256ch 1×1 conv adapter，ZeroConv 初始化）作为 ControlNet 输入
+- `train_concat_paca.py` 增加 `--use-dr / --use-controlnet / --control-source {dr,cbct_latent} / --controlnet-fusion {add,paca,both}` 模块开关
+- ControlNet 输入源切换：`--control-source {dr, cbct_latent}`。`dr` 使用 DR 输出的 `base_channels×64×64` feature；`cbct_latent` 使用 VAE-encoded CBCT latent 经 `3→base_channels` 1×1 ZeroConv adapter 后的 feature
 - Fixed val 可视化与 decoded sCT 指标（MAE / PSNR / SSIM，分 region 记录）
 - 推理 sampler：DDIM 50 步实现
 
@@ -126,34 +126,39 @@ CLI 等价：
 - 建立最小可靠 baseline；后续所有增强模块都必须和 A0 比较
 - 确认仅靠 CBCT latent concat + region embedding 能否生成可用 sCT
 
-### B 系列：DR 辅助监督
+### B 系列：DR feature 作为 ControlNet 输入
 
 ```text
-B1 = A0 + DR (γ=0.5)
-B2 = A0 + DR (γ=1.0)
+B1 = A0 + DR + ControlNet residual add, γ=0.5
+B2 = A0 + DR + ControlNet residual add, γ=1.0
 ```
 
-`--use-dr=True --use-controlnet=False --gamma {0.5, 1.0}`
+`--use-dr=True --use-controlnet=True --control-source=dr --controlnet-fusion=add --gamma {0.5, 1.0}`
 
-注意：A0 没有 ControlNet，DR 的 `controlnet_input` 输出在 B 系列中**没有下游消费者**，仅 `pred_128 / pred_64` 经 L1 与 GT CT 对齐，作为 CBCT→CT 像素空间辅助监督。这就是 B 想验证的——"在不引入 ControlNet 的情况下，给 encoder 加这条 pixel-space 辅助路径是否对 latent diffusion 有帮助"。
+注意：DR 必须接入生成主干才有实验意义。这里 DR 的 `controlnet_input` 作为 ControlNet 条件 feature 进入 UNet；`pred_128 / pred_64` 通过 γ 加权的 pixel-space L1 进行辅助监督。
+
+本组回答的问题：
+
+- DR feature 作为 ControlNet 条件，是否比 A0 更好？
+- 在 DR feature 路径成立时，γ=0.5 还是 γ=1.0 更合适？
 
 判断（量化）：
 
 - **B 优于 A0**：`val/mae_hu` 降低 ≥ 5 HU 或 `val/ssim` 提升 ≥ 0.01，且 fixed val 图像无明显伪影增加
 - **B1 vs B2**：差距 < 上述阈值视为持平，优先选更稳定的 γ=0.5
-- **B 全部劣于 A0**：DR 不进入 D1，C 系列不再叠加 DR
+- **B 全部劣于 A0**：DR source 不进入 D1
 
-### C 系列：ControlNet / PACA 融合
+### C 系列：CBCT latent adapter + ControlNet / PACA 融合
 
 ```text
-C1 = A0 + ControlNet (residual add only)
-C2 = A0 + ControlNet (PACA only)
-C3 = A0 + ControlNet (residual add + PACA)
+C1 = A0 + ControlNet using CBCT latent adapter (residual add only)
+C2 = A0 + ControlNet using CBCT latent adapter (PACA only)
+C3 = A0 + ControlNet using CBCT latent adapter (residual add + PACA)
 ```
 
-`--use-dr=False --use-controlnet=True --controlnet-fusion {add, paca, both}`
+`--use-dr=False --use-controlnet=True --control-source=cbct_latent --controlnet-fusion {add, paca, both}`
 
-注意：C 系列不启用 DR，因此 ControlNet 输入由"VAE-encoded CBCT latent + 1×1 conv adapter (ZeroConv)"提供，不是 DR 输出。该 adapter 视为 ControlNet 的一部分，参数量归入 ControlNet。
+注意：C 系列不启用 DR，因此 ControlNet 输入由 "VAE-encoded CBCT latent + 1×1 ZeroConv adapter" 提供，不是 DR 输出。adapter 通道为 `3→base_channels`，参数量归入 ControlNet。
 
 C1 / C2 / C3 **统一跑 50 epoch**，避免不公平比较（旧版给 C3 30 epoch 是错的）。
 
@@ -163,25 +168,33 @@ C1 / C2 / C3 **统一跑 50 epoch**，避免不公平比较（旧版给 C3 30 ep
 - C 全部劣于 A0：ControlNet/PACA 不进入 D1
 - C 中至少一个优于 A0 ≥ 5 HU MAE：保留最优融合方式
 
+B 与 C 的核心对比：
+
+- B：ControlNet 条件来自 DR feature，同时有 DR auxiliary loss
+- C：ControlNet 条件来自 CBCT latent adapter，无 DR auxiliary loss
+
+因此 B/C 共同回答 "ControlNet 条件源选 DR feature 还是 CBCT latent adapter"，C 组内部再回答 "residual add / PACA / both 哪种融合更合适"。
+
 ### D1：最终主模型
 
 ```text
-D1 = A0 + best DR (from B) + best fusion (from C)
+D1 = A0 + best ControlNet source + best fusion + best γ if source=DR
 ```
 
-如果 B 全部劣于 A0：D1 退化为 A0 + best C
-如果 C 全部劣于 A0：D1 退化为 A0 + best B
+如果 B 胜出：D1 使用 `control-source=dr`，γ 取 B1/B2 最优值；fusion 默认先用 `add`，除非 C2/C3 显著证明 PACA/both 对 CBCT latent source 有收益，再补一个 DR+PACA 交叉点确认。
+如果 C 胜出：D1 使用 `control-source=cbct_latent`，fusion 取 C1/C2/C3 最优值，不启用 DR。
+如果 B 和 C 均优于 A0 但收益接近：优先选更简单/更稳定/更快的组合；必要时补 1 个交叉点（DR source + best C fusion）。
 如果 B 和 C 都劣于 A0：D1 = A0 长训（200 epoch）即为最终模型
 
 启动门控：
 
 - B 和 C 系列全部完成 ≥ 50 epoch 且 fixed val 图像已上传
-- 确定 best B（gamma）与 best C（fusion）
+- 确定 best ControlNet source、best fusion、以及 DR source 是否值得保留
 - 启动 D1 长训前在 wandb 写一条 note 说明组合选择依据
 
-### 解耦假设
+### 交互假设
 
-本矩阵假设 DR 与 ControlNet 融合方式之间无显著交互——即"先选最佳 γ、再选最佳 fusion、组合即最优"。我们不跑 B × C 的笛卡尔积。如果 D1 显著劣于预期（< A0 + max(best B, best C) 收益之和的一半），再回头补 1–2 个交叉点。
+本矩阵不完整展开 `control-source × fusion × gamma`。默认先用 B 评估 DR source，用 C 评估 CBCT latent source 下的 fusion。如果最终 D1 的选择需要跨源复用 fusion（例如 C2 的 PACA only 很强，但 B2 的 DR source 也很强），则补 1 个交叉点再长训，而不是直接假设组合最优。
 
 ---
 
@@ -224,18 +237,18 @@ A0 / B1 / B2 / C1 / C2 / C3 一律 50 epoch，effective batch=8，seed=42。
 ```text
 Step 0  合并 §1.4 前置 PR
 Step 1  A0     smoke 5 ep  →  screen 50 ep
-Step 2  B1     smoke 5 ep  →  screen 50 ep
-        B2     smoke 5 ep  →  screen 50 ep
-Step 3  C1     smoke 5 ep  →  screen 50 ep
+Step 2  C1     smoke 5 ep  →  screen 50 ep
         C2     smoke 5 ep  →  screen 50 ep
         C3     smoke 5 ep  →  screen 50 ep
-Step 4  确定 best B、best C，写 wandb note
+Step 3  B1     smoke 5 ep  →  screen 50 ep
+        B2     smoke 5 ep  →  screen 50 ep
+Step 4  确定 best ControlNet source / fusion / gamma，必要时补 1 个交叉点
 Step 5  A0-long  200 ep    （与 D1 并行启动）
         D1       200–300 ep
 Step 6  比较 D1 vs A0-long（200 ep 同 budget）
 ```
 
-资源紧张时可先删 B2 或 C3（按 §三的判断阈值，二者更可能与同组其它 run 持平）。
+资源紧张时可先删 B2 或 C3（按 §三的判断阈值，二者更可能与同组其它 run 持平）。但如果 B1 明显优于 A0，B2 应补跑以确认 γ。
 
 ---
 
@@ -281,7 +294,7 @@ wandb 指标见 §2.2 / §2.3，所有 run 必须完整。
 1. **VAE 不重训**：当前 `vae_best.pth` 基于旧 train=199 split 训练；val 23 例不变，val 指标可横向比较。Phase 1 完成前不重训。
 2. **Latent 用 mu，不用 sample**：节省一次随机采样，且 mu 在 reconstruction 任务上更稳定，不做消融。
 3. **Region embedding 始终开启**：不做消融，相关价值参考已有 prior 工作。
-4. **B 与 C 解耦**：见 §三末尾，不跑笛卡尔积。
+4. **不全量展开交互**：见 §三末尾，不跑完整 `control-source × fusion × gamma` 笛卡尔积；必要时只补关键交叉点。
 5. **不切 held-out test**：盲提交集（官方 val zip 42 例）由 D1 完成后单独写 inference 脚本。
 6. **Phase 2 全局引导**：不在本矩阵内。仅当 D1 在 AB / TH 出现明显全局上下文缺失时再考虑。
 
@@ -291,8 +304,9 @@ wandb 指标见 §2.2 / §2.3，所有 run 必须完整。
 
 按本 SPEC 执行所必需的代码改动：
 
-- [ ] `train_concat_paca.py` 增加 `--use-dr / --use-controlnet / --controlnet-fusion`，三者组合覆盖 A0 / B / C / D1
-- [ ] `--use-controlnet=True && --use-dr=False` 时，ControlNet 输入由 VAE-encoded CBCT latent 经 ZeroConv adapter 提供
+- [ ] `train_concat_paca.py` 增加 `--use-dr / --use-controlnet / --control-source {dr,cbct_latent} / --controlnet-fusion {add,paca,both}`，覆盖 A0 / B / C / D1
+- [ ] `--control-source=dr` 时，ControlNet 输入来自 DR 的 `base_channels×64×64` feature，并启用 `pred_128/pred_64` auxiliary loss
+- [ ] `--control-source=cbct_latent` 时，ControlNet 输入由 VAE-encoded CBCT latent 经 `3→base_channels` ZeroConv adapter 提供
 - [ ] Fixed val cases 配置：`configs/fixed_val_cases.yaml` + dataloader 支持
 - [ ] Decoded sCT 指标：MAE（HU）/ PSNR / SSIM，整体 + 分 region
 - [ ] DDIM 50 步 sampler，固定噪声 seed
