@@ -461,6 +461,7 @@ def train_unet_concat_control_paca(
     ema_path=None,
     eval_every=10,
     fixed_val_batch=None,
+    fixed_val_max_images=48,
 ):
     if controlnet_fusion not in ("add", "paca", "both"):
         raise ValueError("controlnet_fusion must be one of: add, paca, both")
@@ -680,7 +681,7 @@ def train_unet_concat_control_paca(
                 _log_fixed_val_images(
                     vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                    amp_enabled, wandb_logger, epoch + 1, sampler_init=sampler_init,
+                    amp_enabled, wandb_logger, epoch + 1, max_images=fixed_val_max_images, sampler_init=sampler_init,
                     sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
                 )
 

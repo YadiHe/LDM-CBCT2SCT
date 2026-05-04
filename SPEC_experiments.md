@@ -16,36 +16,42 @@
 - Latent 模式：使用 VAE `mu`（不 reparameterize），不做消融
 - Region embedding：始终开启，不做消融
 - 主 loss：mask-weighted diffusion MSE（latent 空间，mask 由 256→64 avg-pool 得到）
-- Inference sampler：DDIM 50 步，η=0（确定性）；评估默认用此设置（见 §二）
+- Inference sampler：DDIM 50 步，η=0（确定性），默认 `sampler_init=cbct, sampler_t_start=300, sampler_alpha=1.0`；评估默认用此设置（见 §二）
 
 ### 1.2 训练配置（screening 阶段必须一致）
 
 | 项 | 值 | 说明 |
 |---|---|---|
 | `base_channels` | 64 | A/B/C 全部固定；D1 长训可单独调高 |
-| **effective batch** | **8** | 跨实验固定的公平性约束 |
-| `batch_size` × `grad_accum_steps` | 见下表 | 按各实验显存裕度选择，乘积=8 |
+| **effective batch** | **64** | 跨实验固定的公平性约束；通过 micro-batch × grad accumulation 达成 |
+| `batch_size` × `grad_accum_steps` | 见下表 | 按各实验显存裕度选择，乘积=64 |
 | AMP | on（autocast + GradScaler） | 用 `--no-amp` 仅排查 NaN |
 | Optimizer | AdamW, lr=1e-5, wd=1e-4 | 见下方 lr 说明 |
 | Scheduler | linear warmup 1000 step → constant | |
 | Seed | 42 | `torch.manual_seed(42)`；DataLoader `worker_init_fn` 也固定 |
 | `num_workers` | 4 | |
 
-**Effective batch 必须固定为 8**（loss 曲线可比），但 micro-batch 按各实验显存裕度选：
+**Effective batch 必须固定为 64**（loss 曲线可比），但 micro-batch 按各实验显存裕度选。A0 的 `batch_size=96` 已在 VAE encoder attention 阶段 OOM，后续不作为默认配置；显存优先保证稳定完成 50 epoch，而不是追求单次 micro-batch 最大化：
 
 | 实验 | 推荐 `batch_size` | `grad_accum_steps` | 备注 |
 |---|---|---|---|
-| A0 | 8 | 1 | 最小，无 ControlNet / DR |
-| B1 / B2 | 4 | 2 | DR + ControlNet；DR feature 接入生成主干 |
-| C1 / C2 / C3 | 4 | 2 | CBCT latent adapter + ControlNet/PACA，需要 accum |
-| D1（base_ch=64） | 4 | 2 | 同 B/C |
-| D1（如升 base_ch=128） | 2 | 4 | 长训前再决定是否升 |
+| A0 | 64 | 1 | 已验证可稳定跑完 50 epoch；bs96 有 OOM 风险 |
+| B1 / B2 | 32 | 2 | DR + ControlNet；DR feature 接入生成主干 |
+| C1 / C2 / C3 | 32 | 2 | CBCT latent adapter + ControlNet/PACA，需要 accum |
+| D1（base_ch=64） | 32 | 2 | 同 B/C |
+| D1（如升 base_ch=128） | 16 | 4 | 长训前再决定是否升 |
 
 每个 run 必须把实际 `batch_size` × `grad_accum_steps` 写到 wandb config，便于审计。
 
 **lr 说明**：旧版 5e-6 在 5 epoch smoke test 上 loss 能下降，但 50 epoch screening 内可能不足以让模块差异显现。改用 1e-5（ControlNet 原论文同量级），配 1000 step linear warmup 缓解前期不稳定。A0 smoke test 必须先验证 1e-5 不发散；若发散则回退 5e-6 并在所有实验里同步回退。
 
 > D1 长训允许在确定模块组合后调整 base_channels / batch / lr，但需要在 wandb 显式记录变更。
+
+### 1.2.1 正则化与 EMA 策略（2026-05-04 更新）
+
+- Screening 阶段默认 `dropout_rate=0.0`。`dropout_rate=0.1 + EMA` 的 A0 诊断 run 在 epoch 23 因 OOM 中断，且早期 decoded 指标弱于无 dropout A0；因此 dropout 不进入默认实验矩阵。
+- EMA 代码已可用，但在 50 epoch screening 中不作为唯一模型选择依据。若开启 EMA，必须同时记录 raw 与 EMA 的 decoded 指标，或在 run note 中说明只用 EMA 评估的限制。
+- D1 长训可以开启 EMA；建议在确定最佳模块组合后再统一开启，避免 A/B/C screening 因 EMA decay 滞后导致比较不清。
 
 ### 1.3 WandB 与产物命名
 
@@ -79,7 +85,7 @@
 - 每个 region 选 4 例（共 16 例 patient），按 manifest val split 的字母序前 4 位
 - 每例固定 z 索引：mask 前景面积最大的 3 个 slice（共 48 张 slice）
 - 用于：图像可视化（CBCT / GT CT / sCT / |error|）+ 定性比较
-- Fixed val 推理使用 seed=0 的固定噪声起点（DDIM 起点 latent 由 `torch.Generator(device).manual_seed(0)` 生成）
+- Fixed val 推理使用固定 seed=0；默认从 CBCT latent 加噪到 `t_start=300` 后执行 DDIM 去噪，保证跨 run 可视化可比
 
 ### 2.2 完整 val 集指标
 
@@ -94,7 +100,7 @@
 | `val/ssim` | pixel，[-1,1]，data_range=2 | mask 内 | window=11 |
 | `val/mae_hu_{BB,AB,HN,TH}` | 同上 | 分 region | 监控部位间差异 |
 
-- sCT 重建：`x_t=DDIM(50 步) → VAE.decode → clamp(-1,1) → (x+1)/2*(1500-(-1024))-1024 = HU`
+- sCT 重建：`x_t=CBCT-init(t_start=300) → DDIM(50 步) → VAE.decode → clamp(-1,1) → (x+1)/2*(1500-(-1024))-1024 = HU`
 - **MAE 必须反归一化回 HU**（量纲依赖，"差 30 HU"才有临床可解释性）
 - **PSNR / SSIM 在哪个范围算结果完全相同**（只要 `data_range` 跟着改：[-1,1] → 2、[0,1] → 1、HU → 2524）。统一用 [-1,1] + `data_range=2`，简洁且避免读者误以为换空间数值就变
 - SSIM 计算范围由"全图"改为 mask 内：保持与 MAE / PSNR 一致，避免 padding 区域（值=-1，恒等）人为抬高 SSIM
@@ -125,6 +131,12 @@ CLI 等价：
 
 - 建立最小可靠 baseline；后续所有增强模块都必须和 A0 比较
 - 确认仅靠 CBCT latent concat + region embedding 能否生成可用 sCT
+
+当前状态（2026-05-04）：
+
+- `A0-bs64-cbct300-bc64-ep50-s42` 已完成 50 epoch，作为当前 screening baseline：`val/mae_hu=156.69`、`val/psnr=20.68`、`val/ssim=0.817`。
+- `A0-drop01-ema-bs96-cbct300-bc64-ep50-s42` 只作为诊断 run：epoch 23 后在 VAE encoder attention OOM，未完成 50 epoch；早期指标 `val/mae_hu=213.73`、`val/psnr=18.25`、`val/ssim=0.761`，不纳入正式矩阵排序。
+- A0 暂不继续反复调参。下一步优先验证 ControlNet 条件路径是否能突破 A0 上限。
 
 ### B 系列：ControlNet 条件源 = DR feature
 
@@ -203,7 +215,7 @@ D1 = A0 + best ControlNet source + best fusion + best γ if source=DR
 
 ### 4.2 Screening run：50 epoch
 
-A0 / B1 / B2 / C1 / C2 / C3 一律 50 epoch，effective batch=8，seed=42。
+A0 / B1 / B2 / C1 / C2 / C3 一律 50 epoch，effective batch=64，seed=42。
 
 提前停止条件（screening 阶段）：
 
@@ -226,9 +238,9 @@ A0 / B1 / B2 / C1 / C2 / C3 一律 50 epoch，effective batch=8，seed=42。
 ## 五、推荐执行顺序
 
 ```text
-Step 0  合并 §1.4 前置 PR
-Step 1  A0     smoke 5 ep  →  screen 50 ep
-Step 2  C1     smoke 5 ep  →  screen 50 ep
+Step 0  合并 §1.4 前置 PR                         [done]
+Step 1  A0     smoke 5 ep  →  screen 50 ep        [done: use A0-bs64-cbct300-bc64-ep50-s42]
+Step 2  C1     smoke 5 ep  →  screen 50 ep        [next]
         C2     smoke 5 ep  →  screen 50 ep
         C3     smoke 5 ep  →  screen 50 ep
 Step 3  B1     smoke 5 ep  →  screen 50 ep
@@ -240,6 +252,17 @@ Step 6  比较 D1 vs A0-long（200 ep 同 budget）
 ```
 
 资源紧张时可先删 B2 或 C3（按 §三的判断阈值，二者更可能与同组其它 run 持平）。但如果 B1 明显优于 A0，B2 应补跑以确认 γ。
+
+C1 启动建议：
+
+```text
+--use-controlnet --control-source cbct_latent --controlnet-fusion add
+--base-channels 64 --batch-size 32 --grad-accum-steps 2
+--dropout-rate 0.0
+--sampler-init cbct --sampler-t-start 300 --sampler-alpha 1.0
+```
+
+先跑 5 epoch smoke；若显存稳定且无 NaN，再启动 50 epoch screen。若 C1 的 decoded fixed val 仍接近噪声或 30 epoch 时 `val/mae_hu` 明显劣于 A0，则暂停 C2/C3，先复查 sampling/decoded eval 链路。
 
 ---
 
@@ -266,15 +289,15 @@ Step 6  比较 D1 vs A0-long（200 ep 同 budget）
 
 ```text
 checkpoints/phase1_matrix/{run_name}/
-  ├── unet_best.pth                 # 按 val/mae_hu 选 best
-  ├── controlnet_best.pth           # 仅 C / D1
-  ├── dr_best.pth                   # 仅 B / D1
-  ├── train_config.yaml             # CLI args + git commit + seed
-  ├── fixed_val_samples/{epoch}/    # CBCT/GT/sCT/error PNG
-  └── metrics.csv                   # epoch, train_loss, val_loss, val/mae_hu, ...
+  ├── unet_full.pth                 # 当前 raw UNet 权重
+  ├── unet_ema.pth                  # 仅 --use-ema 时保存
+  ├── unet_ema_state.pth            # 仅 --use-ema 时保存，供续训
+  ├── paca_layers.pth               # PACA/adapter 相关权重
+  ├── controlnet_best.pth           # 仅 C / D1，若当前实现拆分保存
+  └── dr_best.pth                   # 仅 B / D1，若当前实现拆分保存
 ```
 
-wandb 指标见 §2.2 / §2.3，所有 run 必须完整。
+wandb 指标见 §2.2 / §2.3，所有 run 必须完整。当前 fixed val 图像、loss 曲线和 decoded metrics 以 wandb 为主；若后续需要完全离线审计，再补 `train_config.yaml` / `metrics.csv` 文件落盘。
 
 ---
 
@@ -292,18 +315,18 @@ wandb 指标见 §2.2 / §2.3，所有 run 必须完整。
 
 ---
 
-## 九、待实现能力（Step 0 PR 范围）
+## 九、Step 0 能力状态
 
 按本 SPEC 执行所必需的代码改动：
 
-- [ ] `train_concat_paca.py` 增加 `--use-dr / --use-controlnet / --control-source {dr,cbct_latent} / --controlnet-fusion {add,paca,both}`，覆盖 A0 / B / C / D1
-- [ ] `--control-source=dr` 时，ControlNet 输入来自 DR 的 `base_channels×64×64` feature，并启用 `pred_128/pred_64` auxiliary loss
-- [ ] `--control-source=cbct_latent` 时，ControlNet 输入由 VAE-encoded CBCT latent 经 `3→base_channels` ZeroConv adapter 提供
-- [ ] Fixed val cases 配置：`configs/fixed_val_cases.yaml` + dataloader 支持
-- [ ] Decoded sCT 指标：MAE（HU）/ PSNR / SSIM，整体 + 分 region
-- [ ] DDIM 50 步 sampler，固定噪声 seed
-- [ ] WandB 记录 `gpu_mem_max_gb` / `epoch_time_sec` / `step_time_ms` / 可训练参数量
-- [ ] WandB run name / tag / group 按 §1.3 约定生成
-- [ ] `--seed` 参数 + DataLoader `worker_init_fn` 固定
+- [x] `train_concat_paca.py` 增加 `--use-dr / --use-controlnet / --control-source {dr,cbct_latent} / --controlnet-fusion {add,paca,both}`，覆盖 A0 / B / C / D1
+- [x] `--control-source=dr` 时，ControlNet 输入来自 DR 的 `base_channels×64×64` feature，并启用 `pred_128/pred_64` auxiliary loss
+- [x] `--control-source=cbct_latent` 时，ControlNet 输入由 VAE-encoded CBCT latent 经 `3→base_channels` ZeroConv adapter 提供
+- [x] Fixed val cases 配置：`configs/fixed_val_cases.yaml` + dataloader 支持
+- [x] Decoded sCT 指标：MAE（HU）/ PSNR / SSIM，整体 + 分 region
+- [x] DDIM 50 步 sampler，固定 seed；默认 CBCT-init `t_start=300`
+- [x] WandB 记录 `gpu_mem_max_gb` / `epoch_time_sec` / `step_time_ms` / 可训练参数量
+- [x] WandB run name / tag / group 按 §1.3 约定生成
+- [x] `--seed` 参数 + DataLoader `worker_init_fn` 固定
 
-完成后 §三的实验矩阵才可执行。
+Step 0 已完成，§三的实验矩阵可以继续从 C1 开始执行。

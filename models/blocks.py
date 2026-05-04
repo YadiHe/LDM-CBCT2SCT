@@ -306,7 +306,7 @@ class PACALayer(nn.Module):
         k = k.view(b, c_q, h * w).transpose(1, 2)
         v = v.view(b, c_q, h * w).transpose(1, 2)
 
-        attn_output, _ = self.mha(q, k, v)
+        attn_output, _ = self.mha(q, k, v, need_weights=False)
         attn_output = attn_output.transpose(1, 2).contiguous().view(b, c_q, h, w)
         attn_output = self.to_out(attn_output)
 

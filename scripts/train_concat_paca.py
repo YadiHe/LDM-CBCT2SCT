@@ -388,6 +388,7 @@ def main():
             sampler_alpha=args.sampler_alpha,
             eval_every=args.eval_every,
             fixed_val_batch=fixed_val_batch,
+            fixed_val_max_images=args.fixed_val_max_images,
         )
     finally:
         if wandb_logger:
