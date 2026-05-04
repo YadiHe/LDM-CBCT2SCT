@@ -31,6 +31,55 @@ class LatentControlAdapter(nn.Module):
         return self.proj(x)
 
 
+class ModelEMA:
+    """Track an exponential moving average of a module state_dict."""
+
+    def __init__(self, model, decay=0.999):
+        self.decay = float(decay)
+        self.shadow = {
+            key: value.detach().clone()
+            for key, value in model.state_dict().items()
+        }
+        self.backup = None
+
+    def update(self, model):
+        state = model.state_dict()
+        for key, value in state.items():
+            value = value.detach()
+            if torch.is_floating_point(value):
+                self.shadow[key].mul_(self.decay).add_(value, alpha=1.0 - self.decay)
+            else:
+                self.shadow[key] = value.clone()
+
+    def store(self, model):
+        self.backup = {
+            key: value.detach().clone()
+            for key, value in model.state_dict().items()
+        }
+
+    def copy_to(self, model):
+        model.load_state_dict(self.shadow, strict=True)
+
+    def restore(self, model):
+        if self.backup is None:
+            return
+        model.load_state_dict(self.backup, strict=True)
+        self.backup = None
+
+    def state_dict(self):
+        return {
+            "decay": self.decay,
+            "shadow": self.shadow,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.decay = float(state_dict.get("decay", self.decay))
+        self.shadow = {
+            key: value.detach().clone()
+            for key, value in state_dict["shadow"].items()
+        }
+
+
 class UNetConcatControlPACA(nn.Module):
     def __init__(self, 
                  in_channels=3, 
@@ -407,6 +456,9 @@ def train_unet_concat_control_paca(
     sampler_init="noise",
     sampler_t_start=999,
     sampler_alpha=1.0,
+    use_ema=False,
+    ema_decay=0.999,
+    ema_path=None,
     eval_every=10,
     fixed_val_batch=None,
 ):
@@ -458,6 +510,12 @@ def train_unet_concat_control_paca(
         optimizer,
         lr_lambda=lambda step: min(1.0, float(step + 1) / float(max(warmup_steps, 1))) if warmup_steps > 0 else 1.0,
     )
+    ema = ModelEMA(unet, decay=ema_decay) if use_ema else None
+    if ema is not None and ema_path:
+        ema.load_state_dict(torch.load(ema_path, map_location=device))
+        print(f"UNet EMA resumed from: {ema_path}")
+    if ema is not None:
+        print(f"UNet EMA enabled: decay={ema.decay}")
     diffusion = Diffusion(device, timesteps=1000)
 
     best_val_loss = float('inf')
@@ -517,6 +575,8 @@ def train_unet_concat_control_paca(
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
+                if ema is not None:
+                    ema.update(unet)
                 optimizer_steps += 1
                 global_step += 1
 
@@ -528,117 +588,136 @@ def train_unet_concat_control_paca(
         avg_train_loss_diff = train_loss_diff / max(train_batches, 1)
         avg_train_loss_dr = train_loss_dr / max(train_batches, 1)
 
-        unet.eval()
-        if controlnet is not None:
-            controlnet.eval()
-        if dr_module is not None:
-            dr_module.eval()
-        if control_adapter is not None:
-            control_adapter.eval()
-        val_loss_total = val_loss_diff = val_loss_dr = 0.0
-        val_batches = min(len(val_loader), max_val_batches) if max_val_batches is not None else len(val_loader)
-        val_generator = torch.Generator(device=device).manual_seed(42)
+        if ema is not None:
+            ema.store(unet)
+            ema.copy_to(unet)
 
-        with torch.no_grad():
-            for i, (ct_img, cbct_img, mask, region_id) in enumerate(val_loader):
-                if max_val_batches is not None and i >= max_val_batches:
-                    break
-                ct_img = ct_img.to(device)
-                cbct_img = cbct_img.to(device)
-                mask = mask.to(device)
-                region_id = region_id.to(device)
+        try:
+            unet.eval()
+            if controlnet is not None:
+                controlnet.eval()
+            if dr_module is not None:
+                dr_module.eval()
+            if control_adapter is not None:
+                control_adapter.eval()
+            val_loss_total = val_loss_diff = val_loss_dr = 0.0
+            val_batches = min(len(val_loader), max_val_batches) if max_val_batches is not None else len(val_loader)
+            val_generator = torch.Generator(device=device).manual_seed(42)
 
-                with autocast(enabled=amp_enabled):
-                    z_ct = _encode_vae(vae, ct_img, latent_mode)
-                    cbct_z = _encode_vae(vae, cbct_img, latent_mode)
-                    control_feature, intermediate_preds = _control_inputs(
-                        cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source
-                    )
-                    t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
-                    noise = torch.randn(z_ct.shape, device=z_ct.device, dtype=z_ct.dtype, generator=val_generator)
-                    z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
-                    pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
-                                                use_controlnet, controlnet_fusion)
-                    latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                    loss_diff = _masked_mse_loss(pred_noise, noise, latent_mask)
-                    loss_dr = degradation_loss(intermediate_preds, ct_img, mask) if use_dr else torch.zeros((), device=device)
-                    total_loss = loss_diff + gamma * loss_dr
+            with torch.no_grad():
+                for i, (ct_img, cbct_img, mask, region_id) in enumerate(val_loader):
+                    if max_val_batches is not None and i >= max_val_batches:
+                        break
+                    ct_img = ct_img.to(device)
+                    cbct_img = cbct_img.to(device)
+                    mask = mask.to(device)
+                    region_id = region_id.to(device)
 
-                val_loss_total += float(total_loss.detach())
-                val_loss_diff += float(loss_diff.detach())
-                val_loss_dr += float(loss_dr.detach())
+                    with autocast(enabled=amp_enabled):
+                        z_ct = _encode_vae(vae, ct_img, latent_mode)
+                        cbct_z = _encode_vae(vae, cbct_img, latent_mode)
+                        control_feature, intermediate_preds = _control_inputs(
+                            cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source
+                        )
+                        t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
+                        noise = torch.randn(z_ct.shape, device=z_ct.device, dtype=z_ct.dtype, generator=val_generator)
+                        z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
+                        pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
+                                                    use_controlnet, controlnet_fusion)
+                        latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
+                        loss_diff = _masked_mse_loss(pred_noise, noise, latent_mask)
+                        loss_dr = degradation_loss(intermediate_preds, ct_img, mask) if use_dr else torch.zeros((), device=device)
+                        total_loss = loss_diff + gamma * loss_dr
 
-        avg_val_loss_total = val_loss_total / max(val_batches, 1)
-        avg_val_loss_diff = val_loss_diff / max(val_batches, 1)
-        avg_val_loss_dr = val_loss_dr / max(val_batches, 1)
+                    val_loss_total += float(total_loss.detach())
+                    val_loss_diff += float(loss_diff.detach())
+                    val_loss_dr += float(loss_dr.detach())
 
-        early_stopping_counter += 1
-        epoch_time = time.time() - epoch_start
-        gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
-        current_lr = optimizer.param_groups[0]['lr']
-        step_time_ms = epoch_time * 1000.0 / max(train_batches, 1)
+            avg_val_loss_total = val_loss_total / max(val_batches, 1)
+            avg_val_loss_diff = val_loss_diff / max(val_batches, 1)
+            avg_val_loss_dr = val_loss_dr / max(val_batches, 1)
 
-        print(
-            f"Epoch {epoch+1} | Train {avg_train_loss_total:.6f} (Diff {avg_train_loss_diff:.6f}, DR {avg_train_loss_dr:.6f}) | "
-            f"Val {avg_val_loss_total:.6f} (Diff {avg_val_loss_diff:.6f}, DR {avg_val_loss_dr:.6f}) | "
-            f"LR {current_lr:.2e} | {epoch_time:.1f}s | GPU {gpu_mem:.2f}GB"
-        )
+            early_stopping_counter += 1
+            epoch_time = time.time() - epoch_start
+            gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+            current_lr = optimizer.param_groups[0]['lr']
+            step_time_ms = epoch_time * 1000.0 / max(train_batches, 1)
 
-        extra_metrics = {
-            "train/loss_diff": avg_train_loss_diff,
-            "train/loss_dr": avg_train_loss_dr,
-            "val/loss_diff": avg_val_loss_diff,
-            "val/loss_dr": avg_val_loss_dr,
-            "train/batches": train_batches,
-            "val/batches": val_batches,
-            "train/optimizer_steps": optimizer_steps,
-            "train/grad_accum_steps": grad_accum_steps,
-            "gpu_mem_max_gb": gpu_mem,
-            "epoch_time_sec": epoch_time,
-            "step_time_ms": step_time_ms,
-            "trainable_params": sum(p.numel() for p in params_to_train),
-            "sampler/t_start": sampler_t_start,
-            "sampler/alpha": sampler_alpha,
-        }
-
-        if (epoch + 1) % max(eval_every, 1) == 0:
-            decoded_metrics = _eval_decoded_metrics(
-                vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
-                use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                amp_enabled, max_val_batches=max_val_batches, sampler_init=sampler_init,
-                sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
-            )
-            extra_metrics.update(decoded_metrics)
-            _log_fixed_val_images(
-                vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
-                use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                amp_enabled, wandb_logger, epoch + 1, sampler_init=sampler_init,
-                sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
+            val_label = "ValEMA" if ema is not None else "Val"
+            print(
+                f"Epoch {epoch+1} | Train {avg_train_loss_total:.6f} (Diff {avg_train_loss_diff:.6f}, DR {avg_train_loss_dr:.6f}) | "
+                f"{val_label} {avg_val_loss_total:.6f} (Diff {avg_val_loss_diff:.6f}, DR {avg_val_loss_dr:.6f}) | "
+                f"LR {current_lr:.2e} | {epoch_time:.1f}s | GPU {gpu_mem:.2f}GB"
             )
 
-        if wandb_logger:
-            wandb_logger.log_training_step(
-                epoch=epoch + 1,
-                train_loss=avg_train_loss_total,
-                val_loss=avg_val_loss_total,
-                learning_rate=current_lr,
-                extra_metrics=extra_metrics,
-            )
+            extra_metrics = {
+                "train/loss_diff": avg_train_loss_diff,
+                "train/loss_dr": avg_train_loss_dr,
+                "val/loss_diff": avg_val_loss_diff,
+                "val/loss_dr": avg_val_loss_dr,
+                "train/batches": train_batches,
+                "val/batches": val_batches,
+                "train/optimizer_steps": optimizer_steps,
+                "train/grad_accum_steps": grad_accum_steps,
+                "gpu_mem_max_gb": gpu_mem,
+                "epoch_time_sec": epoch_time,
+                "step_time_ms": step_time_ms,
+                "trainable_params": sum(p.numel() for p in params_to_train),
+                "sampler/t_start": sampler_t_start,
+                "sampler/alpha": sampler_alpha,
+                "ema/enabled": 1 if ema is not None else 0,
+                "ema/decay": ema.decay if ema is not None else 0.0,
+            }
 
-        if avg_val_loss_total < best_val_loss:
-            best_val_loss = avg_val_loss_total
-            early_stopping_counter = 0
-            torch.save(unet.state_dict(), os.path.join(save_dir, "unet_full.pth"))
-            if controlnet is not None and use_controlnet:
-                torch.save(controlnet.state_dict(), os.path.join(save_dir, "controlnet.pth"))
-            if dr_module is not None and use_dr:
-                torch.save(dr_module.state_dict(), os.path.join(save_dir, "dr_module.pth"))
-            if control_adapter is not None and use_controlnet and control_source == "cbct_latent":
-                torch.save(control_adapter.state_dict(), os.path.join(save_dir, "control_adapter.pth"))
-            paca_state_dict = {k: v for k, v in unet.state_dict().items() if 'paca' in k.lower()}
-            if paca_state_dict:
-                torch.save(paca_state_dict, os.path.join(save_dir, "paca_layers.pth"))
-            print(f"Saved best epoch {epoch+1}: val {avg_val_loss_total:.6f}")
+            if (epoch + 1) % max(eval_every, 1) == 0:
+                decoded_metrics = _eval_decoded_metrics(
+                    vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
+                    use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
+                    amp_enabled, max_val_batches=max_val_batches, sampler_init=sampler_init,
+                    sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
+                )
+                extra_metrics.update(decoded_metrics)
+                _log_fixed_val_images(
+                    vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
+                    use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
+                    amp_enabled, wandb_logger, epoch + 1, sampler_init=sampler_init,
+                    sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
+                )
+
+            if wandb_logger:
+                wandb_logger.log_training_step(
+                    epoch=epoch + 1,
+                    train_loss=avg_train_loss_total,
+                    val_loss=avg_val_loss_total,
+                    learning_rate=current_lr,
+                    extra_metrics=extra_metrics,
+                )
+
+            if avg_val_loss_total < best_val_loss:
+                best_val_loss = avg_val_loss_total
+                early_stopping_counter = 0
+                if ema is not None:
+                    torch.save(ema.backup, os.path.join(save_dir, "unet_full.pth"))
+                    torch.save(unet.state_dict(), os.path.join(save_dir, "unet_ema.pth"))
+                    torch.save(ema.state_dict(), os.path.join(save_dir, "unet_ema_state.pth"))
+                    paca_state_source = ema.backup
+                else:
+                    torch.save(unet.state_dict(), os.path.join(save_dir, "unet_full.pth"))
+                    paca_state_source = unet.state_dict()
+                if controlnet is not None and use_controlnet:
+                    torch.save(controlnet.state_dict(), os.path.join(save_dir, "controlnet.pth"))
+                if dr_module is not None and use_dr:
+                    torch.save(dr_module.state_dict(), os.path.join(save_dir, "dr_module.pth"))
+                if control_adapter is not None and use_controlnet and control_source == "cbct_latent":
+                    torch.save(control_adapter.state_dict(), os.path.join(save_dir, "control_adapter.pth"))
+                paca_state_dict = {k: v for k, v in paca_state_source.items() if 'paca' in k.lower()}
+                if paca_state_dict:
+                    torch.save(paca_state_dict, os.path.join(save_dir, "paca_layers.pth"))
+                suffix = " using EMA" if ema is not None else ""
+                print(f"Saved best epoch {epoch+1}: val {avg_val_loss_total:.6f}{suffix}")
+        finally:
+            if ema is not None:
+                ema.restore(unet)
 
         if early_stopping and early_stopping_counter >= early_stopping:
             print(f"Early stopped after {early_stopping} epochs with no improvement.")

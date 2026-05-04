@@ -82,6 +82,9 @@ def parse_args():
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
     p.add_argument("--warmup-steps",   type=int,   default=1000)
+    p.add_argument("--use-ema", action="store_true",
+                   help="enable UNet EMA for validation, decoded metrics, and saved unet_ema.pth")
+    p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--gamma",          type=float, default=1.0,
                    help="weight for DR auxiliary loss: total = L_diff + gamma * L_dr")
     p.add_argument("--grad-accum-steps", type=int, default=1,
@@ -126,6 +129,8 @@ def parse_args():
     # Resume
     p.add_argument("--unet-path",       default=None,
                    help="resume: path to saved UNet state dict (unet_full.pth)")
+    p.add_argument("--ema-path",        default=None,
+                   help="resume: path to saved UNet EMA state dict (unet_ema_state.pth)")
     p.add_argument("--controlnet-path", default=None,
                    help="resume: path to saved ControlNet state dict")
     p.add_argument("--dr-path",         default=None,
@@ -289,6 +294,7 @@ def main():
         f"Run: {run_name}  Commit: {commit}\n"
         f"Epochs: {args.epochs}  LR: {args.lr}  wd: {args.weight_decay}  gamma: {args.gamma}  "
         f"dropout: {args.dropout_rate}  "
+        f"EMA: {'on' if args.use_ema else 'off'}  "
         f"grad-accum: {args.grad_accum_steps}  AMP: {'off' if args.no_amp else 'on'}  "
         f"early-stop: {args.early_stopping}\n"
         f"use_dr={args.use_dr} use_controlnet={args.use_controlnet} "
@@ -318,6 +324,8 @@ def main():
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
                 "warmup_steps": args.warmup_steps,
+                "use_ema": args.use_ema,
+                "ema_decay": args.ema_decay,
                 "gamma": args.gamma,
                 "grad_accum_steps": args.grad_accum_steps,
                 "effective_batch": args.batch_size * args.grad_accum_steps,
@@ -361,6 +369,9 @@ def main():
             learning_rate=args.lr,
             weight_decay=args.weight_decay,
             warmup_steps=args.warmup_steps,
+            use_ema=args.use_ema,
+            ema_decay=args.ema_decay,
+            ema_path=args.ema_path,
             wandb_logger=wandb_logger,
             max_train_batches=args.max_train_batches,
             max_val_batches=args.max_val_batches,
