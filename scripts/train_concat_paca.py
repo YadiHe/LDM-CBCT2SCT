@@ -64,6 +64,8 @@ def parse_args():
     p.add_argument("--base-channels", type=int, default=64,
                    help="base channel width for UNet and ControlNet "
                         "(default 64 → ~31M trainable; 128 → ~124M; 256 → ~497M)")
+    p.add_argument("--dropout-rate", type=float, default=0.0,
+                   help="dropout rate for the UNet backbone")
     p.add_argument("--use-dr", action="store_true",
                    help="enable DR module; valid with --use-controlnet --control-source dr")
     p.add_argument("--use-controlnet", action="store_true",
@@ -224,6 +226,7 @@ def main():
         in_channels=3,
         out_channels=3,
         base_channels=args.base_channels,
+        dropout_rate=args.dropout_rate,
     )
     if args.unet_path:
         state = torch.load(args.unet_path, map_location="cpu")
@@ -285,6 +288,7 @@ def main():
     print(
         f"Run: {run_name}  Commit: {commit}\n"
         f"Epochs: {args.epochs}  LR: {args.lr}  wd: {args.weight_decay}  gamma: {args.gamma}  "
+        f"dropout: {args.dropout_rate}  "
         f"grad-accum: {args.grad_accum_steps}  AMP: {'off' if args.no_amp else 'on'}  "
         f"early-stop: {args.early_stopping}\n"
         f"use_dr={args.use_dr} use_controlnet={args.use_controlnet} "
@@ -309,6 +313,7 @@ def main():
                 "num_workers": args.num_workers,
                 "augmentation": augmentation,
                 "base_channels": args.base_channels,
+                "dropout_rate": args.dropout_rate,
                 "epochs": args.epochs,
                 "lr": args.lr,
                 "weight_decay": args.weight_decay,
