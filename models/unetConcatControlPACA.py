@@ -279,12 +279,21 @@ def _predict_noise(unet, controlnet, z_noisy, cbct_z, t, control_feature, region
 
 
 def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
-                 use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, steps, amp_enabled):
+                 use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, steps, amp_enabled,
+                 sampler_init="noise", sampler_t_start=999, sampler_alpha=1.0):
     cbct_z = _encode_vae(vae, cbct_img, latent_mode)
     control_feature, _ = _control_inputs(cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source)
     generator = torch.Generator(device=cbct_img.device).manual_seed(0)
-    x = torch.randn(cbct_z.shape, device=cbct_z.device, dtype=cbct_z.dtype, generator=generator)
-    timesteps = torch.linspace(diffusion.timesteps - 1, 0, steps, device=cbct_z.device).long()
+    sampler_t_start = int(min(max(sampler_t_start, 0), diffusion.timesteps - 1))
+    timesteps = torch.linspace(sampler_t_start, 0, steps, device=cbct_z.device).long()
+    noise = torch.randn(cbct_z.shape, device=cbct_z.device, dtype=cbct_z.dtype, generator=generator)
+    if sampler_init == "cbct":
+        alpha_eff = (sampler_alpha * diffusion.alpha_cumprod[timesteps[0]]).clamp(0.0, 1.0).view(1, 1, 1, 1)
+        x = torch.sqrt(alpha_eff) * cbct_z + torch.sqrt(1.0 - alpha_eff) * noise
+    elif sampler_init == "noise":
+        x = noise
+    else:
+        raise ValueError("sampler_init must be one of: noise, cbct")
 
     for idx, t_scalar in enumerate(timesteps):
         t = torch.full((cbct_z.size(0),), int(t_scalar.item()), device=cbct_z.device, dtype=torch.long)
@@ -303,7 +312,8 @@ def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, c
 
 def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                          amp_enabled, max_val_batches=None):
+                          amp_enabled, max_val_batches=None, sampler_init="noise", sampler_t_start=999,
+                          sampler_alpha=1.0):
     totals = {"mae_hu": 0.0, "psnr": 0.0, "ssim": 0.0}
     region_totals = {name: [0.0, 0] for name in REGION_NAMES.values()}
     count = 0
@@ -316,7 +326,8 @@ def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, dif
             mask = mask.to(device)
             region_id = region_id.to(device)
             sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
-                               use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps, amp_enabled)
+                               use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
+                               amp_enabled, sampler_init, sampler_t_start, sampler_alpha)
             sct = sct * mask + (-1.0) * (1.0 - mask)
             mae_per = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp_min(1.0)
             psnr = _masked_psnr(sct, ct_img, mask)
@@ -340,7 +351,8 @@ def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, dif
 
 def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                          amp_enabled, wandb_logger, epoch, max_images=8):
+                          amp_enabled, wandb_logger, epoch, max_images=8, sampler_init="noise",
+                          sampler_t_start=999, sampler_alpha=1.0):
     if not wandb_logger or fixed_val_batch is None:
         return
     ct_img, cbct_img, mask, region_id, captions = fixed_val_batch
@@ -350,7 +362,8 @@ def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, dif
     region_id = region_id[:max_images].to(device)
     with torch.no_grad():
         sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
-                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps, amp_enabled)
+                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
+                           amp_enabled, sampler_init, sampler_t_start, sampler_alpha)
     sct = sct * mask + (-1.0) * (1.0 - mask)
     err = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).clamp(0, 300) / 300.0
     for i in range(ct_img.size(0)):
@@ -391,6 +404,9 @@ def train_unet_concat_control_paca(
     controlnet_fusion="add",
     latent_mode="mu",
     ddim_steps=50,
+    sampler_init="noise",
+    sampler_t_start=999,
+    sampler_alpha=1.0,
     eval_every=10,
     fixed_val_batch=None,
 ):
@@ -398,6 +414,8 @@ def train_unet_concat_control_paca(
         raise ValueError("controlnet_fusion must be one of: add, paca, both")
     if latent_mode not in ("mu", "sample"):
         raise ValueError("latent_mode must be one of: mu, sample")
+    if sampler_init not in ("noise", "cbct"):
+        raise ValueError("sampler_init must be one of: noise, cbct")
     if use_dr and (not use_controlnet or control_source != "dr"):
         raise ValueError("--use-dr is only supported with --use-controlnet --control-source dr")
     if use_controlnet and control_source == "dr" and dr_module is None:
@@ -579,19 +597,23 @@ def train_unet_concat_control_paca(
             "epoch_time_sec": epoch_time,
             "step_time_ms": step_time_ms,
             "trainable_params": sum(p.numel() for p in params_to_train),
+            "sampler/t_start": sampler_t_start,
+            "sampler/alpha": sampler_alpha,
         }
 
         if (epoch + 1) % max(eval_every, 1) == 0:
             decoded_metrics = _eval_decoded_metrics(
                 vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                 use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                amp_enabled, max_val_batches=max_val_batches,
+                amp_enabled, max_val_batches=max_val_batches, sampler_init=sampler_init,
+                sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
             )
             extra_metrics.update(decoded_metrics)
             _log_fixed_val_images(
                 vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                 use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                amp_enabled, wandb_logger, epoch + 1,
+                amp_enabled, wandb_logger, epoch + 1, sampler_init=sampler_init,
+                sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
             )
 
         if wandb_logger:

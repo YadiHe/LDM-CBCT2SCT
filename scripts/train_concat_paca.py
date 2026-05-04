@@ -94,6 +94,12 @@ def parse_args():
                    help="optional smoke-test limit for val batches per epoch")
     p.add_argument("--ddim-steps", type=int, default=50,
                    help="DDIM steps for decoded validation metrics and fixed-val images")
+    p.add_argument("--sampler-init", choices=["noise", "cbct"], default="noise",
+                   help="initial latent for decoded validation sampling")
+    p.add_argument("--sampler-t-start", type=int, default=999,
+                   help="starting diffusion timestep for decoded validation sampling")
+    p.add_argument("--sampler-alpha", type=float, default=1.0,
+                   help="CBCT latent strength when --sampler-init=cbct")
     p.add_argument("--eval-every", type=int, default=10,
                    help="run decoded metrics and fixed-val image upload every N epochs")
     p.add_argument("--seed", type=int, default=42)
@@ -318,6 +324,9 @@ def main():
                 "controlnet_fusion": args.controlnet_fusion,
                 "latent_mode": args.latent_mode,
                 "ddim_steps": args.ddim_steps,
+                "sampler_init": args.sampler_init,
+                "sampler_t_start": args.sampler_t_start,
+                "sampler_alpha": args.sampler_alpha,
                 "eval_every": args.eval_every,
                 "early_stopping": args.early_stopping,
                 "max_train_batches": args.max_train_batches,
@@ -358,6 +367,9 @@ def main():
             controlnet_fusion=args.controlnet_fusion,
             latent_mode=args.latent_mode,
             ddim_steps=args.ddim_steps,
+            sampler_init=args.sampler_init,
+            sampler_t_start=args.sampler_t_start,
+            sampler_alpha=args.sampler_alpha,
             eval_every=args.eval_every,
             fixed_val_batch=fixed_val_batch,
         )
