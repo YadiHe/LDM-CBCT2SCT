@@ -226,6 +226,12 @@ def _masked_psnr(pred, target, mask):
     return float(20.0 * torch.log10(torch.tensor(2.0, device=pred.device)) - 10.0 * torch.log10(mse.clamp_min(1e-12)))
 
 
+def _masked_mse_loss(pred, target, mask):
+    mask = mask.to(dtype=pred.dtype)
+    denom = (mask.sum() * pred.size(1)).clamp_min(1.0)
+    return (((pred - target) ** 2) * mask).sum() / denom
+
+
 def _masked_ssim(pred, target, mask):
     try:
         from skimage.metrics import structural_similarity
@@ -311,6 +317,7 @@ def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, dif
             region_id = region_id.to(device)
             sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
                                use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps, amp_enabled)
+            sct = sct * mask + (-1.0) * (1.0 - mask)
             mae_per = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp_min(1.0)
             psnr = _masked_psnr(sct, ct_img, mask)
             ssim = _masked_ssim(sct, ct_img, mask)
@@ -344,6 +351,7 @@ def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, dif
     with torch.no_grad():
         sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
                            use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps, amp_enabled)
+    sct = sct * mask + (-1.0) * (1.0 - mask)
     err = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).clamp(0, 300) / 300.0
     for i in range(ct_img.size(0)):
         caption = captions[i] if captions else f"sample_{i}"
@@ -477,7 +485,7 @@ def train_unet_concat_control_paca(
                 pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
                                             use_controlnet, controlnet_fusion)
                 latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
+                loss_diff = _masked_mse_loss(pred_noise, noise, latent_mask)
                 loss_dr = degradation_loss(intermediate_preds, ct_img, mask) if use_dr else torch.zeros((), device=device)
                 total_loss = loss_diff + gamma * loss_dr
                 scaled_loss = total_loss / grad_accum_steps
@@ -534,7 +542,7 @@ def train_unet_concat_control_paca(
                     pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
                                                 use_controlnet, controlnet_fusion)
                     latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                    loss_diff = F.mse_loss(pred_noise * latent_mask, noise * latent_mask)
+                    loss_diff = _masked_mse_loss(pred_noise, noise, latent_mask)
                     loss_dr = degradation_loss(intermediate_preds, ct_img, mask) if use_dr else torch.zeros((), device=device)
                     total_loss = loss_diff + gamma * loss_dr
 
