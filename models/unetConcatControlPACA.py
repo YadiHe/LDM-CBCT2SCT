@@ -32,38 +32,45 @@ class LatentControlAdapter(nn.Module):
 
 
 class ModelEMA:
-    """Track an exponential moving average of a module state_dict."""
+    """Track EMA weights for one or more modules."""
 
-    def __init__(self, model, decay=0.999):
+    def __init__(self, modules, decay=0.999):
         self.decay = float(decay)
-        self.shadow = {
-            key: value.detach().clone()
-            for key, value in model.state_dict().items()
-        }
+        if isinstance(modules, nn.Module):
+            modules = {"module": modules}
+        self.modules = dict(modules)
+        self.shadow = {name: self._clone_state(module) for name, module in self.modules.items()}
         self.backup = None
 
-    def update(self, model):
-        state = model.state_dict()
-        for key, value in state.items():
-            value = value.detach()
-            if torch.is_floating_point(value):
-                self.shadow[key].mul_(self.decay).add_(value, alpha=1.0 - self.decay)
-            else:
-                self.shadow[key] = value.clone()
-
-    def store(self, model):
-        self.backup = {
+    @staticmethod
+    def _clone_state(module):
+        return {
             key: value.detach().clone()
-            for key, value in model.state_dict().items()
+            for key, value in module.state_dict().items()
         }
 
-    def copy_to(self, model):
-        model.load_state_dict(self.shadow, strict=True)
+    def update(self):
+        for name, module in self.modules.items():
+            state = module.state_dict()
+            for key, value in state.items():
+                value = value.detach()
+                if torch.is_floating_point(value):
+                    self.shadow[name][key].mul_(self.decay).add_(value, alpha=1.0 - self.decay)
+                else:
+                    self.shadow[name][key] = value.clone()
 
-    def restore(self, model):
+    def store(self):
+        self.backup = {name: self._clone_state(module) for name, module in self.modules.items()}
+
+    def copy_to(self):
+        for name, module in self.modules.items():
+            module.load_state_dict(self.shadow[name], strict=True)
+
+    def restore(self):
         if self.backup is None:
             return
-        model.load_state_dict(self.backup, strict=True)
+        for name, module in self.modules.items():
+            module.load_state_dict(self.backup[name], strict=True)
         self.backup = None
 
     def state_dict(self):
@@ -74,9 +81,15 @@ class ModelEMA:
 
     def load_state_dict(self, state_dict):
         self.decay = float(state_dict.get("decay", self.decay))
+        shadow = state_dict["shadow"]
+        first_value = next(iter(shadow.values())) if shadow else {}
+        if isinstance(first_value, torch.Tensor):
+            target_name = "unet" if "unet" in self.modules else next(iter(self.modules.keys()))
+            self.shadow[target_name] = {key: value.detach().clone() for key, value in shadow.items()}
+            return
         self.shadow = {
-            key: value.detach().clone()
-            for key, value in state_dict["shadow"].items()
+            name: {key: value.detach().clone() for key, value in module_state.items()}
+            for name, module_state in shadow.items()
         }
 
 
@@ -94,6 +107,52 @@ def _build_lr_scheduler(optimizer, lr_schedule, warmup_steps):
         )
 
     raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
+
+
+def _compute_latent_stats(vae, train_loader, device, latent_mode, amp_enabled, max_batches):
+    if max_batches <= 0:
+        return {}
+
+    stats = {
+        "ct_sum": 0.0,
+        "ct_sq_sum": 0.0,
+        "ct_count": 0,
+        "ct_min": float("inf"),
+        "ct_max": float("-inf"),
+        "cbct_sum": 0.0,
+        "cbct_sq_sum": 0.0,
+        "cbct_count": 0,
+        "cbct_min": float("inf"),
+        "cbct_max": float("-inf"),
+    }
+
+    with torch.no_grad():
+        for i, (ct_img, cbct_img, _, _) in enumerate(train_loader):
+            if i >= max_batches:
+                break
+            ct_img = ct_img.to(device)
+            cbct_img = cbct_img.to(device)
+            with autocast(enabled=amp_enabled):
+                z_ct = _encode_vae(vae, ct_img, latent_mode).detach().float()
+                cbct_z = _encode_vae(vae, cbct_img, latent_mode).detach().float()
+            for prefix, z in (("ct", z_ct), ("cbct", cbct_z)):
+                stats[f"{prefix}_sum"] += float(z.sum())
+                stats[f"{prefix}_sq_sum"] += float((z * z).sum())
+                stats[f"{prefix}_count"] += int(z.numel())
+                stats[f"{prefix}_min"] = min(stats[f"{prefix}_min"], float(z.min()))
+                stats[f"{prefix}_max"] = max(stats[f"{prefix}_max"], float(z.max()))
+
+    out = {}
+    for prefix in ("ct", "cbct"):
+        count = max(stats[f"{prefix}_count"], 1)
+        mean = stats[f"{prefix}_sum"] / count
+        var = max(stats[f"{prefix}_sq_sum"] / count - mean * mean, 0.0)
+        out[f"latent/{prefix}_mean"] = mean
+        out[f"latent/{prefix}_std"] = float(var ** 0.5)
+        out[f"latent/{prefix}_min"] = stats[f"{prefix}_min"]
+        out[f"latent/{prefix}_max"] = stats[f"{prefix}_max"]
+    out["latent/stats_batches"] = max_batches
+    return out
 
 
 class UNetConcatControlPACA(nn.Module):
@@ -476,6 +535,7 @@ def train_unet_concat_control_paca(
     use_ema=False,
     ema_decay=0.999,
     ema_path=None,
+    latent_stats_batches=4,
     eval_every=10,
     fixed_val_batch=None,
     fixed_val_max_images=48,
@@ -525,15 +585,44 @@ def train_unet_concat_control_paca(
     print(f"Modules: use_dr={use_dr}, use_controlnet={use_controlnet}, control_source={control_source}, fusion={controlnet_fusion}")
     print(f"Trainable parameters UNet={sum(p.numel() for p in unet_params)} ControlNet={sum(p.numel() for p in controlnet_params)} DR={sum(p.numel() for p in dr_params)} Adapter={sum(p.numel() for p in adapter_params)}")
 
+    train_batches_for_schedule = min(len(train_loader), max_train_batches) if max_train_batches is not None else len(train_loader)
+    optimizer_steps_per_epoch = (train_batches_for_schedule + grad_accum_steps - 1) // grad_accum_steps
+    total_optimizer_steps = max(epochs * optimizer_steps_per_epoch, 1)
+    warmup_ratio = float(warmup_steps) / float(total_optimizer_steps)
+    print(
+        f"Schedule steps: train_batches={train_batches_for_schedule}, "
+        f"optimizer_steps/epoch={optimizer_steps_per_epoch}, total_steps={total_optimizer_steps}, "
+        f"warmup_ratio={warmup_ratio:.3f}"
+    )
+
+    latent_stats = _compute_latent_stats(
+        vae, train_loader, device, latent_mode, amp_enabled, max(int(latent_stats_batches), 0)
+    )
+    if latent_stats:
+        print(
+            "Latent stats "
+            f"ct mean={latent_stats['latent/ct_mean']:.4f} std={latent_stats['latent/ct_std']:.4f} "
+            f"min={latent_stats['latent/ct_min']:.4f} max={latent_stats['latent/ct_max']:.4f} | "
+            f"cbct mean={latent_stats['latent/cbct_mean']:.4f} std={latent_stats['latent/cbct_std']:.4f} "
+            f"min={latent_stats['latent/cbct_min']:.4f} max={latent_stats['latent/cbct_max']:.4f}"
+        )
+
     optimizer = AdamW(params_to_train, lr=learning_rate, weight_decay=weight_decay)
     scaler = GradScaler(enabled=amp_enabled)
     scheduler = _build_lr_scheduler(optimizer, lr_schedule, warmup_steps)
-    ema = ModelEMA(unet, decay=ema_decay) if use_ema else None
+    ema_modules = {"unet": unet}
+    if controlnet is not None and use_controlnet:
+        ema_modules["controlnet"] = controlnet
+    if control_adapter is not None and use_controlnet and control_source == "cbct_latent":
+        ema_modules["control_adapter"] = control_adapter
+    if dr_module is not None and use_dr:
+        ema_modules["dr_module"] = dr_module
+    ema = ModelEMA(ema_modules, decay=ema_decay) if use_ema else None
     if ema is not None and ema_path:
         ema.load_state_dict(torch.load(ema_path, map_location=device))
-        print(f"UNet EMA resumed from: {ema_path}")
+        print(f"EMA resumed from: {ema_path}")
     if ema is not None:
-        print(f"UNet EMA enabled: decay={ema.decay}")
+        print(f"EMA enabled: decay={ema.decay}, modules={','.join(ema.modules.keys())}")
     diffusion = Diffusion(device, timesteps=1000)
 
     best_val_loss = float('inf')
@@ -594,7 +683,7 @@ def train_unet_concat_control_paca(
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 if ema is not None:
-                    ema.update(unet)
+                    ema.update()
                 optimizer_steps += 1
                 global_step += 1
 
@@ -607,8 +696,8 @@ def train_unet_concat_control_paca(
         avg_train_loss_dr = train_loss_dr / max(train_batches, 1)
 
         if ema is not None:
-            ema.store(unet)
-            ema.copy_to(unet)
+            ema.store()
+            ema.copy_to()
 
         try:
             unet.eval()
@@ -680,6 +769,8 @@ def train_unet_concat_control_paca(
                 "train/grad_accum_steps": grad_accum_steps,
                 "lr/current": current_lr,
                 "lr/warmup_steps": warmup_steps,
+                "lr/warmup_ratio": warmup_ratio,
+                "lr/total_steps": total_optimizer_steps,
                 "gpu_mem_max_gb": gpu_mem,
                 "epoch_time_sec": epoch_time,
                 "step_time_ms": step_time_ms,
@@ -689,6 +780,7 @@ def train_unet_concat_control_paca(
                 "ema/enabled": 1 if ema is not None else 0,
                 "ema/decay": ema.decay if ema is not None else 0.0,
             }
+            extra_metrics.update(latent_stats)
 
             if (epoch + 1) % max(eval_every, 1) == 0:
                 decoded_metrics = _eval_decoded_metrics(
@@ -718,18 +810,24 @@ def train_unet_concat_control_paca(
                 best_val_loss = avg_val_loss_total
                 early_stopping_counter = 0
                 if ema is not None:
-                    torch.save(ema.backup, os.path.join(save_dir, "unet_full.pth"))
+                    torch.save(ema.backup["unet"], os.path.join(save_dir, "unet_full.pth"))
                     torch.save(unet.state_dict(), os.path.join(save_dir, "unet_ema.pth"))
                     torch.save(ema.state_dict(), os.path.join(save_dir, "unet_ema_state.pth"))
-                    paca_state_source = ema.backup
+                    paca_state_source = unet.state_dict()
                 else:
                     torch.save(unet.state_dict(), os.path.join(save_dir, "unet_full.pth"))
                     paca_state_source = unet.state_dict()
                 if controlnet is not None and use_controlnet:
+                    if ema is not None and "controlnet" in ema.backup:
+                        torch.save(ema.backup["controlnet"], os.path.join(save_dir, "controlnet_full.pth"))
                     torch.save(controlnet.state_dict(), os.path.join(save_dir, "controlnet.pth"))
                 if dr_module is not None and use_dr:
+                    if ema is not None and "dr_module" in ema.backup:
+                        torch.save(ema.backup["dr_module"], os.path.join(save_dir, "dr_module_full.pth"))
                     torch.save(dr_module.state_dict(), os.path.join(save_dir, "dr_module.pth"))
                 if control_adapter is not None and use_controlnet and control_source == "cbct_latent":
+                    if ema is not None and "control_adapter" in ema.backup:
+                        torch.save(ema.backup["control_adapter"], os.path.join(save_dir, "control_adapter_full.pth"))
                     torch.save(control_adapter.state_dict(), os.path.join(save_dir, "control_adapter.pth"))
                 paca_state_dict = {k: v for k, v in paca_state_source.items() if 'paca' in k.lower()}
                 if paca_state_dict:
@@ -738,7 +836,7 @@ def train_unet_concat_control_paca(
                 print(f"Saved best epoch {epoch+1}: val {avg_val_loss_total:.6f}{suffix}")
         finally:
             if ema is not None:
-                ema.restore(unet)
+                ema.restore()
 
         if early_stopping and early_stopping_counter >= early_stopping:
             print(f"Early stopped after {early_stopping} epochs with no improvement.")

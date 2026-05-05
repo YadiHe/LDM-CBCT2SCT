@@ -13,7 +13,7 @@
         --batch-size 16 \
         --grad-accum-steps 1 \
         --epochs 300 \
-        --lr 5e-6
+        --lr 5e-6 \
         --lr-schedule sd-warmup-constant \
         --warmup-steps 10000
 
@@ -90,6 +90,8 @@ def parse_args():
     p.add_argument("--use-ema", action="store_true",
                    help="enable UNet EMA for validation, decoded metrics, and saved unet_ema.pth")
     p.add_argument("--ema-decay", type=float, default=0.999)
+    p.add_argument("--latent-stats-batches", type=int, default=4,
+                   help="number of initial train batches used to print latent mean/std diagnostics")
     p.add_argument("--gamma",          type=float, default=1.0,
                    help="weight for DR auxiliary loss: total = L_diff + gamma * L_dr")
     p.add_argument("--grad-accum-steps", type=int, default=1,
@@ -333,6 +335,7 @@ def main():
                 "warmup_steps": args.warmup_steps,
                 "use_ema": args.use_ema,
                 "ema_decay": args.ema_decay,
+                "latent_stats_batches": args.latent_stats_batches,
                 "gamma": args.gamma,
                 "grad_accum_steps": args.grad_accum_steps,
                 "effective_batch": args.batch_size * args.grad_accum_steps,
@@ -380,6 +383,7 @@ def main():
             use_ema=args.use_ema,
             ema_decay=args.ema_decay,
             ema_path=args.ema_path,
+            latent_stats_batches=args.latent_stats_batches,
             wandb_logger=wandb_logger,
             max_train_batches=args.max_train_batches,
             max_val_batches=args.max_val_batches,
