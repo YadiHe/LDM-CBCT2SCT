@@ -480,25 +480,31 @@ def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, dif
     if not wandb_logger or fixed_val_batch is None:
         return
     ct_img, cbct_img, mask, region_id, captions = fixed_val_batch
-    ct_img = ct_img[:max_images].to(device)
-    cbct_img = cbct_img[:max_images].to(device)
-    mask = mask[:max_images].to(device)
-    region_id = region_id[:max_images].to(device)
-    with torch.no_grad():
-        sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
-                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                           amp_enabled, sampler_init, sampler_t_start, sampler_alpha)
-    sct = sct * mask + (-1.0) * (1.0 - mask)
-    err = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).clamp(0, 300) / 300.0
-    for i in range(ct_img.size(0)):
-        caption = captions[i] if captions else f"sample_{i}"
-        panel = _make_comparison_panel(
-            _to_image01(cbct_img[i]).squeeze().cpu().numpy(),
-            _to_image01(ct_img[i]).squeeze().cpu().numpy(),
-            _to_image01(sct[i]).squeeze().cpu().numpy(),
-            err[i].squeeze().cpu().numpy(),
-        )
-        wandb_logger.log_image(f"fixed_val/comparison_{i}", panel, caption, step=epoch)
+    total_images = min(int(max_images), ct_img.size(0))
+    chunk_size = min(8, max(total_images, 1))
+    for start in range(0, total_images, chunk_size):
+        end = min(start + chunk_size, total_images)
+        ct_chunk = ct_img[start:end].to(device)
+        cbct_chunk = cbct_img[start:end].to(device)
+        mask_chunk = mask[start:end].to(device)
+        region_chunk = region_id[start:end].to(device)
+        with torch.no_grad():
+            sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_chunk, region_chunk,
+                               use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
+                               amp_enabled, sampler_init, sampler_t_start, sampler_alpha)
+        sct = sct * mask_chunk + (-1.0) * (1.0 - mask_chunk)
+        err = ((_to_hu(sct) - _to_hu(ct_chunk)).abs() * mask_chunk).clamp(0, 300) / 300.0
+        for local_i in range(ct_chunk.size(0)):
+            i = start + local_i
+            caption = captions[i] if captions else f"sample_{i}"
+            panel = _make_comparison_panel(
+                _to_image01(cbct_chunk[local_i]).squeeze().cpu().numpy(),
+                _to_image01(ct_chunk[local_i]).squeeze().cpu().numpy(),
+                _to_image01(sct[local_i]).squeeze().cpu().numpy(),
+                err[local_i].squeeze().cpu().numpy(),
+            )
+            wandb_logger.log_image(f"fixed_val/comparison_{i}", panel, caption, step=epoch)
+        del ct_chunk, cbct_chunk, mask_chunk, region_chunk, sct, err
 
 
 def train_unet_concat_control_paca(
