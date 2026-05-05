@@ -14,6 +14,8 @@
         --grad-accum-steps 1 \
         --epochs 300 \
         --lr 5e-6
+        --lr-schedule sd-warmup-constant \
+        --warmup-steps 10000
 
 断点续训:
     python scripts/train_concat_paca.py \
@@ -82,6 +84,9 @@ def parse_args():
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
     p.add_argument("--warmup-steps",   type=int,   default=1000)
+    p.add_argument("--lr-schedule", choices=["sd-warmup-constant", "constant"], default="sd-warmup-constant",
+                   help="learning-rate schedule. sd-warmup-constant follows Stable Diffusion/LDM: "
+                        "linear warmup to --lr, then constant")
     p.add_argument("--use-ema", action="store_true",
                    help="enable UNet EMA for validation, decoded metrics, and saved unet_ema.pth")
     p.add_argument("--ema-decay", type=float, default=0.999)
@@ -119,7 +124,7 @@ def parse_args():
     p.add_argument("--exp-id", type=str, default="manual",
                    help="experiment id used in WandB name/tags, e.g. A0/C1/B1")
     p.add_argument("--stage", type=str, default="smoke",
-                   choices=["smoke", "screen", "long", "manual"])
+                   choices=["smoke", "screen", "strong", "long", "manual"])
     p.add_argument("--fixed-val-config", type=str, default="configs/fixed_val_cases.yaml")
     p.add_argument("--fixed-val-cases-per-region", type=int, default=4)
     p.add_argument("--fixed-val-slices-per-case", type=int, default=3)
@@ -293,6 +298,7 @@ def main():
     print(
         f"Run: {run_name}  Commit: {commit}\n"
         f"Epochs: {args.epochs}  LR: {args.lr}  wd: {args.weight_decay}  gamma: {args.gamma}  "
+        f"lr-schedule: {args.lr_schedule} warmup: {args.warmup_steps}  "
         f"dropout: {args.dropout_rate}  "
         f"EMA: {'on' if args.use_ema else 'off'}  "
         f"grad-accum: {args.grad_accum_steps}  AMP: {'off' if args.no_amp else 'on'}  "
@@ -322,6 +328,7 @@ def main():
                 "dropout_rate": args.dropout_rate,
                 "epochs": args.epochs,
                 "lr": args.lr,
+                "lr_schedule": args.lr_schedule,
                 "weight_decay": args.weight_decay,
                 "warmup_steps": args.warmup_steps,
                 "use_ema": args.use_ema,
@@ -368,6 +375,7 @@ def main():
             gamma=args.gamma,
             learning_rate=args.lr,
             weight_decay=args.weight_decay,
+            lr_schedule=args.lr_schedule,
             warmup_steps=args.warmup_steps,
             use_ema=args.use_ema,
             ema_decay=args.ema_decay,

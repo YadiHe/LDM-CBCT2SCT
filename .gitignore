@@ -10,6 +10,7 @@ outputs/
 
 # ── WandB
 wandb/
+logs/
 
 # ── Python
 __pycache__/

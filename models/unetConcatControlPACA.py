@@ -80,6 +80,22 @@ class ModelEMA:
         }
 
 
+def _build_lr_scheduler(optimizer, lr_schedule, warmup_steps):
+    if lr_schedule == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+
+    if lr_schedule == "sd-warmup-constant":
+        warmup_steps = max(int(warmup_steps), 0)
+        if warmup_steps <= 0:
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: min(1.0, float(step + 1) / float(warmup_steps)),
+        )
+
+    raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
+
+
 class UNetConcatControlPACA(nn.Module):
     def __init__(self, 
                  in_channels=3, 
@@ -440,6 +456,7 @@ def train_unet_concat_control_paca(
     gamma=1.0,
     learning_rate=1e-5,
     weight_decay=1e-4,
+    lr_schedule="sd-warmup-constant",
     warmup_steps=1000,
     wandb_logger=None,
     max_train_batches=None,
@@ -469,6 +486,8 @@ def train_unet_concat_control_paca(
         raise ValueError("latent_mode must be one of: mu, sample")
     if sampler_init not in ("noise", "cbct"):
         raise ValueError("sampler_init must be one of: noise, cbct")
+    if lr_schedule not in ("sd-warmup-constant", "constant"):
+        raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
     if use_dr and (not use_controlnet or control_source != "dr"):
         raise ValueError("--use-dr is only supported with --use-controlnet --control-source dr")
     if use_controlnet and control_source == "dr" and dr_module is None:
@@ -502,15 +521,13 @@ def train_unet_concat_control_paca(
 
     print(f"AMP Enabled: {amp_enabled}")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
+    print(f"LR schedule: {lr_schedule} (warmup_steps={warmup_steps})")
     print(f"Modules: use_dr={use_dr}, use_controlnet={use_controlnet}, control_source={control_source}, fusion={controlnet_fusion}")
     print(f"Trainable parameters UNet={sum(p.numel() for p in unet_params)} ControlNet={sum(p.numel() for p in controlnet_params)} DR={sum(p.numel() for p in dr_params)} Adapter={sum(p.numel() for p in adapter_params)}")
 
     optimizer = AdamW(params_to_train, lr=learning_rate, weight_decay=weight_decay)
     scaler = GradScaler(enabled=amp_enabled)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: min(1.0, float(step + 1) / float(max(warmup_steps, 1))) if warmup_steps > 0 else 1.0,
-    )
+    scheduler = _build_lr_scheduler(optimizer, lr_schedule, warmup_steps)
     ema = ModelEMA(unet, decay=ema_decay) if use_ema else None
     if ema is not None and ema_path:
         ema.load_state_dict(torch.load(ema_path, map_location=device))
@@ -659,7 +676,10 @@ def train_unet_concat_control_paca(
                 "train/batches": train_batches,
                 "val/batches": val_batches,
                 "train/optimizer_steps": optimizer_steps,
+                "train/global_step": global_step,
                 "train/grad_accum_steps": grad_accum_steps,
+                "lr/current": current_lr,
+                "lr/warmup_steps": warmup_steps,
                 "gpu_mem_max_gb": gpu_mem,
                 "epoch_time_sec": epoch_time,
                 "step_time_ms": step_time_ms,
