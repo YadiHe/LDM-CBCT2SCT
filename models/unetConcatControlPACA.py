@@ -649,7 +649,11 @@ def train_unet_concat_control_paca(
 
         train_loss_total = train_loss_diff = train_loss_dr = 0.0
         train_batches = min(len(train_loader), max_train_batches) if max_train_batches is not None else len(train_loader)
+        train_valid_batches = 0
+        train_skipped_nonfinite = 0
+        train_skipped_overflow = 0
         optimizer_steps = 0
+        accum_batches = 0
         optimizer.zero_grad(set_to_none=True)
 
         for i, (ct_img, cbct_img, mask, region_id) in enumerate(train_loader):
@@ -679,27 +683,61 @@ def train_unet_concat_control_paca(
                 total_loss = loss_diff + gamma * loss_dr
                 scaled_loss = total_loss / grad_accum_steps
 
+            if not torch.isfinite(total_loss.detach()):
+                train_skipped_nonfinite += 1
+                accum_batches = 0
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    f"Warning: skipped non-finite training loss at epoch {epoch+1}, "
+                    f"batch {i+1}: total={float(total_loss.detach())}"
+                )
+                continue
+
             scaler.scale(scaled_loss).backward()
-            should_step = ((i + 1) % grad_accum_steps == 0) or ((i + 1) == train_batches)
+            accum_batches += 1
+            should_step = (accum_batches >= grad_accum_steps) or ((i + 1) == train_batches)
             if should_step:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params_to_train, max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(params_to_train, max_norm=1.0)
+                scale_before = scaler.get_scale()
+                if not torch.isfinite(grad_norm):
+                    train_skipped_overflow += 1
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_batches = 0
+                    print(
+                        f"Warning: skipped optimizer bookkeeping after non-finite grad norm "
+                        f"at epoch {epoch+1}, batch {i+1}: grad_norm={float(grad_norm.detach())}"
+                    )
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
-                if ema is not None:
-                    ema.update()
-                optimizer_steps += 1
-                global_step += 1
+                scale_after = scaler.get_scale()
+                amp_overflow = scaler.is_enabled() and scale_after < scale_before
+                if amp_overflow:
+                    train_skipped_overflow += 1
+                    print(
+                        f"Warning: skipped scheduler/EMA after AMP overflow at epoch {epoch+1}, "
+                        f"batch {i+1}: scale {scale_before:.1f}->{scale_after:.1f}"
+                    )
+                else:
+                    scheduler.step()
+                    if ema is not None:
+                        ema.update()
+                    optimizer_steps += 1
+                    global_step += 1
+                accum_batches = 0
 
             train_loss_total += float(total_loss.detach())
             train_loss_diff += float(loss_diff.detach())
             train_loss_dr += float(loss_dr.detach())
+            train_valid_batches += 1
 
-        avg_train_loss_total = train_loss_total / max(train_batches, 1)
-        avg_train_loss_diff = train_loss_diff / max(train_batches, 1)
-        avg_train_loss_dr = train_loss_dr / max(train_batches, 1)
+        avg_train_loss_total = train_loss_total / max(train_valid_batches, 1)
+        avg_train_loss_diff = train_loss_diff / max(train_valid_batches, 1)
+        avg_train_loss_dr = train_loss_dr / max(train_valid_batches, 1)
 
         if ema is not None:
             ema.store()
@@ -769,6 +807,9 @@ def train_unet_concat_control_paca(
                 "val/loss_diff": avg_val_loss_diff,
                 "val/loss_dr": avg_val_loss_dr,
                 "train/batches": train_batches,
+                "train/valid_batches": train_valid_batches,
+                "train/skipped_nonfinite_batches": train_skipped_nonfinite,
+                "train/skipped_overflow_steps": train_skipped_overflow,
                 "val/batches": val_batches,
                 "train/optimizer_steps": optimizer_steps,
                 "train/global_step": global_step,
@@ -812,7 +853,14 @@ def train_unet_concat_control_paca(
                     extra_metrics=extra_metrics,
                 )
 
-            if avg_val_loss_total < best_val_loss:
+            losses_are_finite = np.isfinite(avg_train_loss_total) and np.isfinite(avg_val_loss_total)
+            if not losses_are_finite:
+                print(
+                    f"Warning: non-finite epoch metrics at epoch {epoch+1}; "
+                    "skipping best checkpoint save."
+                )
+
+            if losses_are_finite and avg_val_loss_total < best_val_loss:
                 best_val_loss = avg_val_loss_total
                 early_stopping_counter = 0
                 if ema is not None:
