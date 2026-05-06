@@ -78,6 +78,8 @@ def parse_args():
     p.add_argument("--grad-accum-steps", type=int, default=1)
     p.add_argument("--no-amp", action="store_true",
                    help="disable CUDA AMP autocast and GradScaler")
+    p.add_argument("--amp-dtype", choices=["fp16", "bf16"], default="fp16",
+                   help="CUDA autocast dtype when AMP is enabled. bf16 disables GradScaler.")
     p.add_argument("--early-stopping", type=int, default=40,
                    help="stop if val loss doesn't improve for this many epochs")
     p.add_argument("--max-train-batches", type=int, default=None,
@@ -282,6 +284,7 @@ def main():
                 "grad_accum_steps": args.grad_accum_steps,
                 "effective_batch": args.batch_size * args.grad_accum_steps,
                 "amp": not args.no_amp,
+                "amp_dtype": args.amp_dtype,
                 "seed": args.seed,
                 "use_dr": False,
                 "use_controlnet": False,
@@ -332,6 +335,7 @@ def main():
             max_val_batches=args.max_val_batches,
             grad_accum_steps=args.grad_accum_steps,
             amp_enabled=torch.cuda.is_available() and not args.no_amp,
+            amp_dtype=args.amp_dtype,
             use_dr=False,
             use_controlnet=False,
             control_source="cbct_latent",

@@ -109,7 +109,15 @@ def _build_lr_scheduler(optimizer, lr_schedule, warmup_steps):
     raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
 
 
-def _compute_latent_stats(vae, train_loader, device, latent_mode, amp_enabled, max_batches):
+def _autocast_dtype(amp_dtype):
+    if amp_dtype == "bf16":
+        return torch.bfloat16
+    if amp_dtype == "fp16":
+        return torch.float16
+    raise ValueError("amp_dtype must be one of: fp16, bf16")
+
+
+def _compute_latent_stats(vae, train_loader, device, latent_mode, amp_enabled, amp_dtype, max_batches):
     if max_batches <= 0:
         return {}
 
@@ -132,7 +140,7 @@ def _compute_latent_stats(vae, train_loader, device, latent_mode, amp_enabled, m
                 break
             ct_img = ct_img.to(device)
             cbct_img = cbct_img.to(device)
-            with autocast(enabled=amp_enabled):
+            with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
                 z_ct = _encode_vae(vae, ct_img, latent_mode).detach().float()
                 cbct_z = _encode_vae(vae, cbct_img, latent_mode).detach().float()
             for prefix, z in (("ct", z_ct), ("cbct", cbct_z)):
@@ -404,7 +412,7 @@ def _predict_noise(unet, controlnet, z_noisy, cbct_z, t, control_feature, region
 
 def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
                  use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, steps, amp_enabled,
-                 sampler_init="noise", sampler_t_start=999, sampler_alpha=1.0):
+                 amp_dtype="fp16", sampler_init="noise", sampler_t_start=999, sampler_alpha=1.0):
     cbct_z = _encode_vae(vae, cbct_img, latent_mode)
     control_feature, _ = _control_inputs(cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source)
     generator = torch.Generator(device=cbct_img.device).manual_seed(0)
@@ -421,7 +429,7 @@ def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, c
 
     for idx, t_scalar in enumerate(timesteps):
         t = torch.full((cbct_z.size(0),), int(t_scalar.item()), device=cbct_z.device, dtype=torch.long)
-        with autocast(enabled=amp_enabled):
+        with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
             eps = _predict_noise(unet, controlnet, x, cbct_z, t, control_feature, region_id, use_controlnet, controlnet_fusion)
         alpha_t = diffusion.alpha_cumprod[t_scalar].view(1, 1, 1, 1)
         pred_x0 = (x - torch.sqrt(1.0 - alpha_t) * eps) / torch.sqrt(alpha_t)
@@ -436,7 +444,7 @@ def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, c
 
 def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                          amp_enabled, max_val_batches=None, sampler_init="noise", sampler_t_start=999,
+                          amp_enabled, amp_dtype="fp16", max_val_batches=None, sampler_init="noise", sampler_t_start=999,
                           sampler_alpha=1.0):
     totals = {"mae_hu": 0.0, "psnr": 0.0, "ssim": 0.0}
     region_totals = {name: [0.0, 0] for name in REGION_NAMES.values()}
@@ -451,7 +459,7 @@ def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, dif
             region_id = region_id.to(device)
             sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
                                use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                               amp_enabled, sampler_init, sampler_t_start, sampler_alpha)
+                               amp_enabled, amp_dtype, sampler_init, sampler_t_start, sampler_alpha)
             sct = sct * mask + (-1.0) * (1.0 - mask)
             mae_per = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp_min(1.0)
             psnr = _masked_psnr(sct, ct_img, mask)
@@ -475,7 +483,7 @@ def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, dif
 
 def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                          amp_enabled, wandb_logger, epoch, max_images=8, sampler_init="noise",
+                          amp_enabled, amp_dtype, wandb_logger, epoch, max_images=8, sampler_init="noise",
                           sampler_t_start=999, sampler_alpha=1.0):
     if not wandb_logger or fixed_val_batch is None:
         return
@@ -491,7 +499,7 @@ def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, dif
         with torch.no_grad():
             sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_chunk, region_chunk,
                                use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                               amp_enabled, sampler_init, sampler_t_start, sampler_alpha)
+                               amp_enabled, amp_dtype, sampler_init, sampler_t_start, sampler_alpha)
         sct = sct * mask_chunk + (-1.0) * (1.0 - mask_chunk)
         err = ((_to_hu(sct) - _to_hu(ct_chunk)).abs() * mask_chunk).clamp(0, 300) / 300.0
         for local_i in range(ct_chunk.size(0)):
@@ -528,6 +536,7 @@ def train_unet_concat_control_paca(
     max_val_batches=None,
     grad_accum_steps=1,
     amp_enabled=None,
+    amp_dtype="fp16",
     control_adapter=None,
     use_dr=False,
     use_controlnet=False,
@@ -566,6 +575,12 @@ def train_unet_concat_control_paca(
     os.makedirs(predict_dir, exist_ok=True)
     if amp_enabled is None:
         amp_enabled = torch.cuda.is_available()
+    if amp_dtype not in ("fp16", "bf16"):
+        raise ValueError("amp_dtype must be one of: fp16, bf16")
+    if amp_enabled and amp_dtype == "bf16" and torch.cuda.is_available():
+        bf16_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        if not bf16_supported:
+            raise RuntimeError("CUDA bf16 AMP requested but torch.cuda.is_bf16_supported() is false")
     grad_accum_steps = max(int(grad_accum_steps), 1)
 
     vae.to(device).eval()
@@ -585,7 +600,7 @@ def train_unet_concat_control_paca(
     if not params_to_train:
         raise ValueError("No trainable parameters selected.")
 
-    print(f"AMP Enabled: {amp_enabled}")
+    print(f"AMP Enabled: {amp_enabled} ({amp_dtype if amp_enabled else 'off'})")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
     print(f"LR schedule: {lr_schedule} (warmup_steps={warmup_steps})")
     print(f"Modules: use_dr={use_dr}, use_controlnet={use_controlnet}, control_source={control_source}, fusion={controlnet_fusion}")
@@ -602,7 +617,7 @@ def train_unet_concat_control_paca(
     )
 
     latent_stats = _compute_latent_stats(
-        vae, train_loader, device, latent_mode, amp_enabled, max(int(latent_stats_batches), 0)
+        vae, train_loader, device, latent_mode, amp_enabled, amp_dtype, max(int(latent_stats_batches), 0)
     )
     if latent_stats:
         print(
@@ -614,7 +629,7 @@ def train_unet_concat_control_paca(
         )
 
     optimizer = AdamW(params_to_train, lr=learning_rate, weight_decay=weight_decay)
-    scaler = GradScaler(enabled=amp_enabled)
+    scaler = GradScaler(enabled=amp_enabled and amp_dtype == "fp16")
     scheduler = _build_lr_scheduler(optimizer, lr_schedule, warmup_steps)
     ema_modules = {"unet": unet}
     if controlnet is not None and use_controlnet:
@@ -664,11 +679,11 @@ def train_unet_concat_control_paca(
             mask = mask.to(device)
             region_id = region_id.to(device)
 
-            with torch.no_grad(), autocast(enabled=amp_enabled):
+            with torch.no_grad(), autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
                 z_ct = _encode_vae(vae, ct_img, latent_mode)
                 cbct_z = _encode_vae(vae, cbct_img, latent_mode)
 
-            with autocast(enabled=amp_enabled):
+            with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
                 control_feature, intermediate_preds = _control_inputs(
                     cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source
                 )
@@ -764,7 +779,7 @@ def train_unet_concat_control_paca(
                     mask = mask.to(device)
                     region_id = region_id.to(device)
 
-                    with autocast(enabled=amp_enabled):
+                    with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
                         z_ct = _encode_vae(vae, ct_img, latent_mode)
                         cbct_z = _encode_vae(vae, cbct_img, latent_mode)
                         control_feature, intermediate_preds = _control_inputs(
@@ -826,6 +841,9 @@ def train_unet_concat_control_paca(
                 "sampler/alpha": sampler_alpha,
                 "ema/enabled": 1 if ema is not None else 0,
                 "ema/decay": ema.decay if ema is not None else 0.0,
+                "amp/enabled": 1 if amp_enabled else 0,
+                "amp/dtype_fp16": 1 if amp_enabled and amp_dtype == "fp16" else 0,
+                "amp/dtype_bf16": 1 if amp_enabled and amp_dtype == "bf16" else 0,
             }
             extra_metrics.update(latent_stats)
 
@@ -833,14 +851,14 @@ def train_unet_concat_control_paca(
                 decoded_metrics = _eval_decoded_metrics(
                     vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                    amp_enabled, max_val_batches=max_val_batches, sampler_init=sampler_init,
+                    amp_enabled, amp_dtype, max_val_batches=max_val_batches, sampler_init=sampler_init,
                     sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
                 )
                 extra_metrics.update(decoded_metrics)
                 _log_fixed_val_images(
                     vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                    amp_enabled, wandb_logger, epoch + 1, max_images=fixed_val_max_images, sampler_init=sampler_init,
+                    amp_enabled, amp_dtype, wandb_logger, epoch + 1, max_images=fixed_val_max_images, sampler_init=sampler_init,
                     sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
                 )
 

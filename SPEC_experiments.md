@@ -346,9 +346,11 @@ D1 = C1 strong architecture
 1. 从 `D1-strong-bc256-bs20-resume-ep28-s42` 的 best EMA checkpoint 继续，而不是用 final epoch。
 2. 保持 `base_channels=256`、ControlNet add、EMA；把 lr 降到 `3e-5`，warmup 500–1000 step 后 constant。
 3. 优先支持/启用 bf16 AMP；如果环境不支持 bf16，则继续 fp16 但把 `grad_norm=inf` 作为硬监控指标：若平均每 epoch > 1 次，继续降 lr 到 `2e-5` 或临时 `--no-amp` 做短诊断。
-4. 跑 60–100 epoch continuation，而不是一口气 400 epoch；每 10 epoch 看 decoded MAE/PSNR/SSIM 和 fixed val 图像。
-5. continuation 完成后做 sampler sweep：`t_start ∈ {200, 300, 500, 700}` × `alpha ∈ {0.7, 1.0}`，确认当前 `t_start=300` 是否仍最优。
-6. 若 lr=3e-5 稳定但 val/decoded 仍平台，再考虑训练目标层面的改动（例如 timestep/SNR weighting 或 latent scale），不要先盲目加复杂模块。
+4. continuation 首跑采用 `dropout_rate=0.1`，但 run name 必须标注 `drop01`：这是正则化变量，不再是与 D1 pilot 的纯续训等价配置。若 decoded 指标变差或收敛变慢，回退到 dropout 0.0。
+5. micro-batch 先尝试 bs24；若 bf16 + dropout0.1 仍 OOM，则降 bs20，不用牺牲 base256。
+6. 跑 60–100 epoch continuation，而不是一口气 400 epoch；每 10 epoch 看 decoded MAE/PSNR/SSIM 和 fixed val 图像。
+7. continuation 完成后做 sampler sweep：`t_start ∈ {200, 300, 500, 700}` × `alpha ∈ {0.7, 1.0}`，确认当前 `t_start=300` 是否仍最优。
+8. 若 lr=3e-5 稳定但 val/decoded 仍平台，再考虑训练目标层面的改动（例如 timestep/SNR weighting 或 latent scale），不要先盲目加复杂模块。
 
 ### L0：Legacy Concat 后置公平对照
 
@@ -447,7 +449,7 @@ Step 7  D1-strong-bc256 50 epoch pilot [done: effective, but numerically tight]
 Step 8  L0-current retrain：scripts/train_concat_legacy.py 已就绪 [ready]
         待 D1 跑完后或另一卡并行启动；与 D1 共享 manifest / VAE / fixed val / decoded metric 协议
 Step 9  D1-stable-continuation [next]
-        从 D1 pilot best EMA 继续，lr=3e-5，优先 bf16，60–100 epoch，监控 decoded 指标和 grad overflow
+        从 D1 pilot best EMA 继续，lr=3e-5，bf16，dropout0.1，bs24 优先，60–100 epoch，监控 decoded 指标和 grad overflow
 Step 10 sampler sweep [next after Step 9]
         t_start ∈ {200,300,500,700} × alpha ∈ {0.7,1.0}
 ```
@@ -460,9 +462,11 @@ D1-stable-continuation 启动建议：
 --use-controlnet --control-source cbct_latent --controlnet-fusion add
 --base-channels 256
 --use-ema --ema-decay 0.9995
---lr 3e-5 --lr-schedule sd-warmup-constant --warmup-steps 500~1000
---dropout-rate 0.0
---epochs 60~100
+--lr 3e-5 --lr-schedule sd-warmup-constant --warmup-steps 1000
+--amp-dtype bf16
+--dropout-rate 0.1
+--batch-size 24
+--epochs 100
 --sampler-init cbct --sampler-t-start 300 --sampler-alpha 1.0
 ```
 
