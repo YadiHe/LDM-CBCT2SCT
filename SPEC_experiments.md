@@ -53,11 +53,15 @@
 
 意义：确立 decoded 指标理论下界——扩散模型 decoded MAE 不可能低于此值。
 
-**判断规则**：
-- `mae_hu_vae` ≪ 101 HU（D1 pilot）→ 瓶颈在扩散模型，D1 continuation 有意义，继续推进
-- `mae_hu_vae` ≈ 101 HU → 扩散模型已接近 VAE 上限，继续训练 D1 收益有限；需先评估是否重训 VAE 或换更强 VAE
+**结果（2026-05-07，val 23 例，2487 slices）**：
 
-**执行时机**：**D1-stable-continuation 启动之前必须完成**，是阻塞依赖。
+| 指标 | 整体 | AB | BB | HN | TH |
+|---|---:|---:|---:|---:|---:|
+| `mae_hu_vae` | **24.99 HU** | 20.98 | 29.11 | 22.10 | 22.80 |
+| `psnr_vae` | 35.19 dB | — | — | — | — |
+| `ssim_vae` | 0.9778 | — | — | — | — |
+
+**结论**：VAE 不是瓶颈。VAE 重建 MAE 25 HU，D1 pilot 为 101 HU，gap = 76 HU，扩散模型有大量提升空间。继续训练 D1。D1 的理论上限约 25 HU（VAE 重建下界）。
 
 ### Fixed val 定性检查
 
@@ -202,12 +206,9 @@ python scripts/train_concat_paca.py \
 [done]    D1-strong-bc256 50 epoch pilot  (MAE 101, W&B: ab94l2m1)
 [done]    L0-CFG-current  (bc256/bs42/ep55) → 质量差，不作消融基线
 
-[NEXT - 阻塞] VAE 重建基线
-              val 23 例 GT CT encode(mu)→decode，记录 mae_hu_vae / psnr_vae / ssim_vae（整体+分 region）
-              若 mae_hu_vae ≪ 101 → 继续 D1
-              若 mae_hu_vae ≈ 101 → 停止 D1 continuation，先评估 VAE
+[done]    VAE 重建基线  mae_hu_vae=25 HU，gap=76 HU，VAE 不是瓶颈，继续 D1
 
-[then]    D1-stable-continuation
+[NEXT]    D1-stable-continuation
               从 pilot best EMA（恢复 epoch 18），lr=3e-5，bf16，ep100
               每 10 epoch 看 decoded MAE 和 fixed val 图像
 
