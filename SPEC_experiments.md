@@ -1,8 +1,10 @@
 # 主实验矩阵 SPEC
 
-> **当前状态（2026-05-07）**：Screening 已完成；D1-strong-bc256 50 epoch pilot 完成（MAE 101 HU）；L0-CFG-current 正在运行。
+> **当前状态（2026-05-07）**：Screening 已完成；D1-strong-bc256 50 epoch pilot 完成（MAE 101 HU）；L0-CFG-current 已完成，decoded 质量很差，不作为消融基线。
 >
-> **核心策略**：D1（全模块）优先训练到收敛，以 L0-CFG（无 ControlNet、无 region emb）作充分训练后的消融对照。Screening 结果仅用于快速排除明显无效配置，不作为模块贡献的定量证据——50 epoch latent loss 不能代表 decoded 图像质量，不同架构收敛速度不同。
+> **立即下一步**：**先跑 VAE 重建基线**（§二），确认 VAE 不是当前 MAE 101 HU 的瓶颈，再启动 D1-stable-continuation。
+>
+> **核心策略**：D1（全模块全容量）为基准，逐模块关闭做 top-down 消融（D1-no-controlnet、D1-no-region）。消融实验与 D1 使用完全相同的训练协议，保证公平对比。Screening 结果仅用于快速排除明显无效配置，不作为模块贡献的定量证据。
 
 ---
 
@@ -49,9 +51,13 @@
 
 - `mae_hu_vae / psnr_vae / ssim_vae`（整体 + 分 region AB/BB/HN/TH）
 
-意义：确立 decoded 指标理论下界——扩散模型 decoded MAE 不可能低于此值。若两者接近，瓶颈在 VAE 容量，不是扩散模型。
+意义：确立 decoded 指标理论下界——扩散模型 decoded MAE 不可能低于此值。
 
-执行时机：D1-stable-continuation 启动之前（不阻塞训练）。
+**判断规则**：
+- `mae_hu_vae` ≪ 101 HU（D1 pilot）→ 瓶颈在扩散模型，D1 continuation 有意义，继续推进
+- `mae_hu_vae` ≈ 101 HU → 扩散模型已接近 VAE 上限，继续训练 D1 收益有限；需先评估是否重训 VAE 或换更强 VAE
+
+**执行时机**：**D1-stable-continuation 启动之前必须完成**，是阻塞依赖。
 
 ### Fixed val 定性检查
 
@@ -123,46 +129,41 @@ python scripts/train_concat_paca.py \
 
 ---
 
-### L0-CFG：消融基线（对照 D1）
+### L0-CFG：已完成，质量差，不作消融基线
 
-```
-UNetConcatenation（legacy，base_ch=256）
-CFG dropout=0.15 | EMA 0.9999 | bf16 | lr 1e-4 | WSD | bs 42 | epochs 55
-pure noise t_start=999 | DDIM 40 步
-```
+`scripts/train_legacy_cfg.py`（bc256/bs42/ep55/WSD/CFG-dropout0.15/t999/DDIM40）已完成训练，decoded 质量很差。
 
-**当前状态**：running（Step 8）。脚本：`scripts/train_legacy_cfg.py`。
+**结论**：旧版 UNetConcatenation + CFG 方案在当前数据集上不可用，与旧数据集上的成功结果不可复现。不作为 D1 的消融对照——两者训练协议差异太多（CFG、sampler、架构），无法干净地归因。
 
-```bash
-python scripts/train_legacy_cfg.py \
-  --manifest data/manifest.csv \
-  --vae-path checkpoints/vae/vae_best.pth \
-  --save-dir checkpoints/phase1_matrix/L0-CFG-bc256-bs42-ep55-s42 \
-  --base-channels 256 --batch-size 42 --epochs 55 --early-stopping 40 \
-  --lr 1e-4 --lr-schedule wsd \
-  --precision bf16 --ema-decay 0.9999 \
-  --cfg-dropout-rate 0.15 \
-  --latent-mode mu --loss-scope mask \
-  --sampler-init noise --sampler-t-start 999 --ddim-steps 40
-```
-
-epochs=55 对应约 30,690 optimizer steps，与旧成功 run（`concatenation_CFG_20260210_103659_ep400`，29,600 step）等价，而非照抄 400 epoch。显存：bs48/75ep 在 epoch 2 OOM（peak 22.1GB），bs42 稳定（peak 19.95GB）。
-
-**对比意义**：D1 有 ControlNet + region embedding；L0-CFG 无。充分训练后的 decoded MAE 差值即两者联合贡献。
-
-注意非单变量差异：L0-CFG 额外有 CFG dropout、不同 sampler（t999 vs t300）。最终比较时两者都需做 sampler sweep，用各自最优 sampler 结果相互对照。
+**消融改用 D1 自身去模块对比**（见下）。
 
 ---
 
-### 后续消融（可选）
+### D1 模块消融：top-down 去模块对比
 
-若需精确拆分 ControlNet 与 region embedding 的独立贡献，追加：
+以 D1-full 为基准，逐模块关闭，**其他所有训练配置完全一致**（bc256、EMA 0.9995、bf16、lr 3e-5、相同 epoch budget）。
 
+| 实验 | 关闭模块 | 回答的问题 |
+|---|---|---|
+| **D1-full**（已有 pilot） | — | 基准 |
+| **D1-no-controlnet** | ControlNet 关闭（仅保留 CBCT latent concat + region emb） | ControlNet 的边际贡献 |
+| **D1-no-region** | region embedding 关闭（保留 ControlNet） | region embedding 的边际贡献 |
+| **D1-baseline** | 两者都关（仅 CBCT latent concat） | 联合贡献；与 A0-bc256 等价但训练预算一致 |
+
+**执行优先级**：D1-stable-continuation 完成后，先跑 D1-no-controlnet（最重要的变量），再视时间决定是否补 D1-no-region 和 D1-baseline。每个消融实验使用与 D1-continuation 相同的 checkpoint 起点（从头训练，不 fine-tune）和相同 epoch 数。
+
+启动命令模板（以 D1-no-controlnet 为例）：
+
+```bash
+python scripts/train_concat_paca.py \
+  --no-use-controlnet \           # 关闭 ControlNet
+  --base-channels 256 \
+  --use-ema --ema-decay 0.9995 \
+  --lr 3e-5 --lr-schedule sd-warmup-constant --warmup-steps 1000 \
+  --amp-dtype bf16 --batch-size 24 \
+  --epochs 100 \
+  --sampler-init cbct --sampler-t-start 300
 ```
-D1-no-region = D1 配置，去掉 region embedding，其他完全一致
-```
-
-从 D1-strong best EMA 重新训练（不能 fine-tune，region emb 影响 time embedding 维度）。优先级低于 D1/L0-CFG 完成。
 
 ---
 
@@ -199,15 +200,25 @@ D1-no-region = D1 配置，去掉 region embedding，其他完全一致
 ```text
 [done]    A0/B/C/C1/C2/C3 screening
 [done]    D1-strong-bc256 50 epoch pilot  (MAE 101, W&B: ab94l2m1)
-[running] L0-CFG-current  (bc256/bs42/ep55/WSD)
-[next]    VAE 重建基线  — val 23 例 GT CT encode→decode，记录 MAE/PSNR/SSIM 下界
-[next]    D1-stable-continuation  — 从 pilot best EMA，lr=3e-5，bf16，ep100
-[after]   sampler sweep（D1 + L0-CFG 各自跑）
-            t_start ∈ {200, 300, 500, 700, 999} × alpha ∈ {0.7, 1.0}
-            t999 = 纯噪声起点，D1 CBCT 条件来自 latent concat 而非 sampler 起点，
-            纯噪声推理可能同样有效；L0-CFG 已默认 t999
-            用各自最优 sampler 结果做最终 D1 vs L0-CFG 比较
-[if needed] D1-no-region  — 拆分 ControlNet vs region embedding 独立贡献
+[done]    L0-CFG-current  (bc256/bs42/ep55) → 质量差，不作消融基线
+
+[NEXT - 阻塞] VAE 重建基线
+              val 23 例 GT CT encode(mu)→decode，记录 mae_hu_vae / psnr_vae / ssim_vae（整体+分 region）
+              若 mae_hu_vae ≪ 101 → 继续 D1
+              若 mae_hu_vae ≈ 101 → 停止 D1 continuation，先评估 VAE
+
+[then]    D1-stable-continuation
+              从 pilot best EMA（恢复 epoch 18），lr=3e-5，bf16，ep100
+              每 10 epoch 看 decoded MAE 和 fixed val 图像
+
+[then]    sampler sweep（D1）
+              t_start ∈ {200, 300, 500, 700, 999} × alpha ∈ {0.7, 1.0}
+              t999 = 纯噪声起点，D1 CBCT 条件来自 latent concat 而非 sampler 起点，需实测
+
+[then]    D1 模块消融（按优先级）
+              1. D1-no-controlnet  — 最重要，测 ControlNet 边际贡献
+              2. D1-no-region      — 测 region embedding 边际贡献
+              3. D1-baseline       — 两者都关，与 A0-bc256 等价
 ```
 
 ---
@@ -245,6 +256,6 @@ WandB 为主要审计来源；所有 run 必须有完整 decoded metrics、fixed
 
 1. **VAE 冻结**：`vae_best.pth` 基于旧 train=199 split；val 23 例不变，指标横向可比。Phase 1 内不重训。
 2. **PACA 死权重**：D1 `fusion=add` 下 PACA 参数（~200M）不参与 forward，仅占存储和 optimizer 状态。活跃参数约 440M（UNet ~290M + ControlNet ~150M + adapter ~0.05M）。**报数时使用活跃参数**。
-3. **D1 vs L0-CFG 非单变量对照**：差异包含 ControlNet、region embedding、CFG dropout 三个变量，以及 sampler 协议（t300 vs t999）。不是精确消融，但是当前可行的最近似对照。sampler sweep 后统一用各自最优 sampler 结果比较。
+3. **D1 模块消融非独立**：D1-no-controlnet 和 D1-no-region 各自从头训练，每次只改一个变量，其他配置与 D1-full 完全一致。但两者的 checkpoint 起点不同（D1-full 从 pilot EMA 继续，消融实验从头），如果 D1-full 的 pilot 初始化带来额外好处，消融结果可能偏保守。这是当前最可行的设计。
 4. **单 seed**：所有实验基于 seed=42 单次。论文/最终决策前需补 seed=43 复现至少 A0 + D1。
 5. **held-out test**：盲提交集（官方 val 42 例）由 D1 完成后单独写 inference 脚本。当前所有指标来自 val=23 例，最终以官方提交为准。
