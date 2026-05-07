@@ -84,7 +84,7 @@ def parse_args():
     p.add_argument("--lr",             type=float, default=1e-5)
     p.add_argument("--weight-decay",   type=float, default=1e-4)
     p.add_argument("--warmup-steps",   type=int,   default=1000)
-    p.add_argument("--lr-schedule", choices=["sd-warmup-constant", "constant"], default="sd-warmup-constant",
+    p.add_argument("--lr-schedule", choices=["sd-warmup-constant", "sd-warmup-cosine", "constant"], default="sd-warmup-constant",
                    help="learning-rate schedule. sd-warmup-constant follows Stable Diffusion/LDM: "
                         "linear warmup to --lr, then constant")
     p.add_argument("--use-ema", action="store_true",
@@ -100,6 +100,14 @@ def parse_args():
                    help="disable CUDA AMP autocast and GradScaler")
     p.add_argument("--amp-dtype", choices=["fp16", "bf16"], default="fp16",
                    help="CUDA autocast dtype when AMP is enabled. bf16 disables GradScaler.")
+    p.add_argument("--loss-type", choices=["mse", "l1"], default="l1",
+                   help="diffusion noise prediction loss: l1 (default) or mse")
+    p.add_argument("--use-min-snr-weight", action="store_true",
+                   help="enable Min-SNR-γ loss weighting (Hang et al. 2023)")
+    p.add_argument("--min-snr-gamma", type=float, default=5.0,
+                   help="γ for Min-SNR weighting; weight=min(SNR,γ)/SNR")
+    p.add_argument("--cosine-min-lr-ratio", type=float, default=0.1,
+                   help="min LR as ratio of peak LR for sd-warmup-cosine schedule")
     p.add_argument("--early-stopping", type=int,   default=50,
                    help="stop if val loss doesn't improve for this many epochs")
     p.add_argument("--max-train-batches", type=int, default=None,
@@ -353,6 +361,10 @@ def main():
                 "sampler_init": args.sampler_init,
                 "sampler_t_start": args.sampler_t_start,
                 "sampler_alpha": args.sampler_alpha,
+                "loss_type": args.loss_type,
+                "use_min_snr_weight": args.use_min_snr_weight,
+                "min_snr_gamma": args.min_snr_gamma,
+                "cosine_min_lr_ratio": args.cosine_min_lr_ratio,
                 "eval_every": args.eval_every,
                 "early_stopping": args.early_stopping,
                 "max_train_batches": args.max_train_batches,
@@ -405,6 +417,10 @@ def main():
             eval_every=args.eval_every,
             fixed_val_batch=fixed_val_batch,
             fixed_val_max_images=args.fixed_val_max_images,
+            loss_type=args.loss_type,
+            use_min_snr_weight=args.use_min_snr_weight,
+            min_snr_gamma=args.min_snr_gamma,
+            cosine_min_lr_ratio=args.cosine_min_lr_ratio,
         )
     finally:
         if wandb_logger:

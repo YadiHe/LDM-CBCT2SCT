@@ -1,8 +1,8 @@
 # 主实验矩阵 SPEC
 
-> **当前状态（2026-05-07）**：Screening 已完成；D1-strong-bc256 50 epoch pilot 完成（MAE 101 HU）；L0-CFG-current 已完成，decoded 质量很差，不作为消融基线。
+> **当前状态（2026-05-07）**：Screening 完成；pilot 完成（MAE 101 HU）；VAE 基线完成（25 HU，非瓶颈）；L0-CFG 完成（质量差，弃用）。
 >
-> **立即下一步**：**先跑 VAE 重建基线**（§二），确认 VAE 不是当前 MAE 101 HU 的瓶颈，再启动 D1-stable-continuation。
+> **正在运行**：D1-l1-minsnr-cosine（W&B: `8ypydmdw`），从 D1-bf16-drop01 checkpoint 恢复，加 L1 loss + Min-SNR-γ=5 + cosine LR + t999/纯噪声 sampler，目标 100 epoch。
 >
 > **核心策略**：D1（全模块全容量）为基准，逐模块关闭做 top-down 消融（D1-no-controlnet、D1-no-region）。消融实验与 D1 使用完全相同的训练协议，保证公平对比。Screening 结果仅用于快速排除明显无效配置，不作为模块贡献的定量证据。
 
@@ -16,7 +16,7 @@
 - Manifest：`data/manifest.csv`（train 218 / val 23，patient-level split）
 - VAE：`checkpoints/vae/vae_best.pth`，**冻结**，Phase 1 内不重训
 - Latent 模式：VAE `mu`（不 reparameterize）
-- Loss：mask-weighted diffusion MSE（latent 空间，mask 由 256→64 avg-pool）
+- Loss：**mask-weighted diffusion L1 + Min-SNR-γ=5 加权**（latent 空间，mask 由 256→64 avg-pool）。L1 比 MSE 对离群值更鲁棒；Min-SNR-γ 降权高 SNR（低 t）timestep，让训练更平衡
 
 ### D1-strong 训练配置
 
@@ -27,8 +27,11 @@
 | EMA | on，`ema_decay=0.9995` |
 | AMP | bf16 优先；fp16 下监控 `skipped_overflow_steps` |
 | Optimizer | AdamW，`wd=1e-4` |
-| LR（continuation） | `3e-5`，warmup 1000 step → constant |
+| LR（continuation） | `3e-5` peak，warmup 500 step → **cosine decay 到 3e-6**（min_lr_ratio=0.1） |
+| Loss | **L1**（diffusion noise prediction），mask-weighted；**Min-SNR-γ=5** 加权 |
+| `dropout-rate` | 0.1 |
 | `batch_size` | 24（bf16 下约 19 GB peak）；OOM 则降 20 |
+| Sampler（训练期 val） | **`noise` / t999**（纯噪声，标准 DDIM）；CBCT 通过 latent concat 注入 |
 | Seed | 42 |
 | `num_workers` | 4 |
 
@@ -107,28 +110,50 @@ EMA 0.9995 | bf16 | lr 3e-5 | WSD warmup→constant | bs 24
 
 训练历史：原始 bs24 run（`iodr4amf`）在 epoch 22 出现 NaN，从 epoch 22 EMA 恢复后 bs20 + lr=5e-5 续训 28 epoch；期间 `grad_norm=inf` 跳步但无 NaN。Best checkpoint 在恢复 epoch 18（总 epoch ~40）。
 
-**D1-stable-continuation 启动命令**：
+**D1-l1-minsnr-cosine 启动命令（2026-05-07，W&B: `8ypydmdw`，运行中）**：
 
 ```bash
+CKPT=checkpoints/phase1_matrix/D1-bf16-drop01-bc256-bs24-ep100-s42
+
 python scripts/train_concat_paca.py \
+  --manifest data/manifest.csv \
+  --vae-path checkpoints/vae/vae_best.pth \
+  --save-dir checkpoints/phase1_matrix/D1-l1-minsnr-cosine-bc256-bs24-ep100-s42 \
   --use-controlnet --control-source cbct_latent --controlnet-fusion add \
   --base-channels 256 \
   --use-ema --ema-decay 0.9995 \
-  --lr 3e-5 --lr-schedule sd-warmup-constant --warmup-steps 1000 \
+  --dropout-rate 0.1 \
+  --lr 3e-5 --lr-schedule sd-warmup-cosine --warmup-steps 500 --cosine-min-lr-ratio 0.1 \
   --amp-dtype bf16 --batch-size 24 \
   --epochs 100 \
-  --sampler-init cbct --sampler-t-start 300 --sampler-alpha 1.0 \
-  --resume checkpoints/phase1_matrix/D1-strong-bc256-bs20-resume-ep28-s42/unet_ema_state.pth
+  --sampler-init noise --sampler-t-start 999 --sampler-alpha 1.0 \
+  --loss-type l1 \
+  --use-min-snr-weight --min-snr-gamma 5.0 \
+  --unet-path          $CKPT/unet_full.pth \
+  --ema-path           $CKPT/unet_ema_state.pth \
+  --controlnet-path    $CKPT/controlnet_full.pth \
+  --control-adapter-path $CKPT/control_adapter_full.pth \
+  --exp-id D1-l1-minsnr-cosine --stage strong \
+  --seed 42
 ```
 
-从 pilot best EMA checkpoint（恢复 epoch 18）继续。监控要点：
+> **续训参数说明**：脚本无 `--resume`。需分别传 `--unet-path`（`unet_full.pth`）、`--ema-path`（`unet_ema_state.pth`）、`--controlnet-path`（`controlnet_full.pth`）、`--control-adapter-path`（`control_adapter_full.pth`）。`unet_ema.pth`/`controlnet.pth` 仅用于推理。
+
+**本次三处关键变更（vs pilot）**：
+1. **L1 loss**（替换 MSE）：对 CBCT 伪影/离群值更鲁棒
+2. **Min-SNR-γ=5 加权**：低 t（高 SNR）timestep 降权，避免它们主导梯度；训练更平衡
+3. **Cosine LR decay**：3e-5 → 3e-6 渐降，避免后期震荡
+4. **t999/纯噪声 sampler**（替换 t300/cbct-init）：标准 DDIM 推理；D1 的 CBCT 条件已通过 latent concat 注入 UNet，t_start 不是唯一注入点
+
+监控要点：
 - 若 `grad_norm=inf` 频繁（>1次/epoch）→ 先降 lr 到 2e-5
 - 每 10 epoch 看 decoded MAE/PSNR/SSIM 和 fixed val 图像；若平台 → 做 sampler sweep，不要急着加模块
 - 若 decoded 指标在 ep100 仍无改善 → 做 sampler sweep 再判断，不假设模型容量不够
 
 **停止条件**：
 - 任意 epoch NaN → 立刻停，降 lr 重启
-- ep 100 MAE > 100 HU（pilot 已达 101）→ 排查 lr / EMA / sampler，不继续到 400 epoch
+- ep 50 MAE 仍 > 90 HU → 2D 可能是架构瓶颈，认真评估 MAISI CBCT→CT
+- ep 100 MAE > 80 HU → 排查 sampler / EMA decay，不无条件加 epoch
 - epoch time × 总 epoch 超出算力预算 → 评估是否降到 D1-128
 
 ---
@@ -208,13 +233,17 @@ python scripts/train_concat_paca.py \
 
 [done]    VAE 重建基线  mae_hu_vae=25 HU，gap=76 HU，VAE 不是瓶颈，继续 D1
 
-[NEXT]    D1-stable-continuation
-              从 pilot best EMA（恢复 epoch 18），lr=3e-5，bf16，ep100
-              每 10 epoch 看 decoded MAE 和 fixed val 图像
+[running] D1-l1-minsnr-cosine  (W&B: 8ypydmdw，2026-05-07 启动)
+              从 D1-bf16-drop01-bc256-bs24-ep100-s42 恢复
+              改动：L1 loss + Min-SNR-γ=5 + cosine LR (3e-5→3e-6) + t999/纯噪声
+              save-dir: D1-l1-minsnr-cosine-bc256-bs24-ep100-s42
+              ep30/50/80 看 decoded MAE 走势：
+                ep30 < 80 HU → 有望 60，继续
+                ep50 仍 90+ → 2D 可能是瓶颈，评估 MAISI
 
-[then]    sampler sweep（D1）
-              t_start ∈ {200, 300, 500, 700, 999} × alpha ∈ {0.7, 1.0}
-              t999 = 纯噪声起点，D1 CBCT 条件来自 latent concat 而非 sampler 起点，需实测
+[then]    sampler sweep（D1，best EMA checkpoint 上）
+              t_start ∈ {200, 300, 500, 700, 999} × init ∈ {cbct, noise} × alpha ∈ {0.7, 1.0}
+              当前训练期已用 noise/t999，sweep 是看是否换回 cbct-init 能进一步降 MAE
 
 [then]    D1 模块消融（按优先级）
               1. D1-no-controlnet  — 最重要，测 ControlNet 边际贡献

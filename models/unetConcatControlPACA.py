@@ -1,3 +1,4 @@
+import math
 import os
 import torch
 import torch.nn as nn
@@ -93,7 +94,7 @@ class ModelEMA:
         }
 
 
-def _build_lr_scheduler(optimizer, lr_schedule, warmup_steps):
+def _build_lr_scheduler(optimizer, lr_schedule, warmup_steps, total_steps=None, min_lr_ratio=0.1):
     if lr_schedule == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
 
@@ -106,7 +107,23 @@ def _build_lr_scheduler(optimizer, lr_schedule, warmup_steps):
             lr_lambda=lambda step: min(1.0, float(step + 1) / float(warmup_steps)),
         )
 
-    raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
+    if lr_schedule == "sd-warmup-cosine":
+        warmup_steps = max(int(warmup_steps), 0)
+        if total_steps is None or total_steps <= warmup_steps:
+            raise ValueError("sd-warmup-cosine requires total_steps > warmup_steps")
+        decay_steps = max(total_steps - warmup_steps, 1)
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step + 1) / float(max(warmup_steps, 1))
+            progress = float(step - warmup_steps) / float(decay_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    raise ValueError("lr_schedule must be one of: sd-warmup-constant, sd-warmup-cosine, constant")
 
 
 def _autocast_dtype(amp_dtype):
@@ -364,6 +381,37 @@ def _masked_mse_loss(pred, target, mask):
     return (((pred - target) ** 2) * mask).sum() / denom
 
 
+def _masked_l1_loss(pred, target, mask):
+    mask = mask.to(dtype=pred.dtype)
+    denom = (mask.sum() * pred.size(1)).clamp_min(1.0)
+    return ((pred - target).abs() * mask).sum() / denom
+
+
+def _masked_mse_loss_per_sample(pred, target, mask):
+    mask = mask.to(dtype=pred.dtype)
+    sq = ((pred - target) ** 2) * mask
+    per_denom = (mask.sum(dim=[1, 2, 3]) * pred.size(1)).clamp_min(1.0)
+    return sq.sum(dim=[1, 2, 3]) / per_denom
+
+
+def _masked_l1_loss_per_sample(pred, target, mask):
+    mask = mask.to(dtype=pred.dtype)
+    abs_diff = (pred - target).abs() * mask
+    per_denom = (mask.sum(dim=[1, 2, 3]) * pred.size(1)).clamp_min(1.0)
+    return abs_diff.sum(dim=[1, 2, 3]) / per_denom
+
+
+def _min_snr_weights(t, alpha_cumprod, gamma=5.0):
+    """Min-SNR-γ weights for epsilon-prediction L1/L2 loss.
+    Reference: Hang et al. 2023, "Efficient Diffusion Training via Min-SNR Weighting Strategy".
+    Per-sample weight: w(t) = min(SNR_t, gamma) / SNR_t,  SNR_t = a_t / (1 - a_t)
+    """
+    a = alpha_cumprod[t].clamp_min(1e-8)
+    snr = a / (1.0 - a).clamp_min(1e-8)
+    w = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+    return w
+
+
 def _masked_ssim(pred, target, mask):
     try:
         from skimage.metrics import structural_similarity
@@ -554,14 +602,21 @@ def train_unet_concat_control_paca(
     eval_every=10,
     fixed_val_batch=None,
     fixed_val_max_images=48,
+    loss_type="l1",
+    use_min_snr_weight=False,
+    min_snr_gamma=5.0,
+    cosine_min_lr_ratio=0.1,
 ):
+    if loss_type not in ("mse", "l1"):
+        raise ValueError("loss_type must be 'mse' or 'l1'")
+    _per_sample_diff_loss_fn = _masked_l1_loss_per_sample if loss_type == "l1" else _masked_mse_loss_per_sample
     if controlnet_fusion not in ("add", "paca", "both"):
         raise ValueError("controlnet_fusion must be one of: add, paca, both")
     if latent_mode not in ("mu", "sample"):
         raise ValueError("latent_mode must be one of: mu, sample")
     if sampler_init not in ("noise", "cbct"):
         raise ValueError("sampler_init must be one of: noise, cbct")
-    if lr_schedule not in ("sd-warmup-constant", "constant"):
+    if lr_schedule not in ("sd-warmup-constant", "sd-warmup-cosine", "constant"):
         raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
     if use_dr and (not use_controlnet or control_source != "dr"):
         raise ValueError("--use-dr is only supported with --use-controlnet --control-source dr")
@@ -630,7 +685,9 @@ def train_unet_concat_control_paca(
 
     optimizer = AdamW(params_to_train, lr=learning_rate, weight_decay=weight_decay)
     scaler = GradScaler(enabled=amp_enabled and amp_dtype == "fp16")
-    scheduler = _build_lr_scheduler(optimizer, lr_schedule, warmup_steps)
+    scheduler = _build_lr_scheduler(optimizer, lr_schedule, warmup_steps,
+                                    total_steps=total_optimizer_steps,
+                                    min_lr_ratio=cosine_min_lr_ratio)
     ema_modules = {"unet": unet}
     if controlnet is not None and use_controlnet:
         ema_modules["controlnet"] = controlnet
@@ -693,7 +750,12 @@ def train_unet_concat_control_paca(
                 pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
                                             use_controlnet, controlnet_fusion)
                 latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                loss_diff = _masked_mse_loss(pred_noise, noise, latent_mask)
+                per_sample_loss = _per_sample_diff_loss_fn(pred_noise, noise, latent_mask)
+                if use_min_snr_weight:
+                    snr_w = _min_snr_weights(t, diffusion.alpha_cumprod, gamma=min_snr_gamma).to(per_sample_loss.dtype)
+                    loss_diff = (per_sample_loss * snr_w).mean()
+                else:
+                    loss_diff = per_sample_loss.mean()
                 loss_dr = degradation_loss(intermediate_preds, ct_img, mask) if use_dr else torch.zeros((), device=device)
                 total_loss = loss_diff + gamma * loss_dr
                 scaled_loss = total_loss / grad_accum_steps
@@ -791,7 +853,12 @@ def train_unet_concat_control_paca(
                         pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
                                                     use_controlnet, controlnet_fusion)
                         latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                        loss_diff = _masked_mse_loss(pred_noise, noise, latent_mask)
+                        per_sample_loss = _per_sample_diff_loss_fn(pred_noise, noise, latent_mask)
+                        if use_min_snr_weight:
+                            snr_w = _min_snr_weights(t, diffusion.alpha_cumprod, gamma=min_snr_gamma).to(per_sample_loss.dtype)
+                            loss_diff = (per_sample_loss * snr_w).mean()
+                        else:
+                            loss_diff = per_sample_loss.mean()
                         loss_dr = degradation_loss(intermediate_preds, ct_img, mask) if use_dr else torch.zeros((), device=device)
                         total_loss = loss_diff + gamma * loss_dr
 
