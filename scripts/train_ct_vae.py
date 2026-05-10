@@ -13,6 +13,7 @@ from datetime import datetime
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -20,8 +21,13 @@ from torch.cuda.amp import autocast, GradScaler
 
 from models.vae import VAE
 from utils.losses import PerceptualLoss, SsimLoss
-from utils.slice_dataset import SliceDataset
+from utils.slice_dataset import SliceDataset, REGION_TO_ID
 from utils.wandb_logger import WandbLogger
+from utils.manifest_checks import validate_manifest_clip
+from utils.hu import CLIP_MIN, CLIP_MAX, to_hu
+from utils.image_metrics import ImageMetrics
+
+REGION_NAMES = {v: k for k, v in REGION_TO_ID.items()}
 
 
 class CTOnlyDataset(Dataset):
@@ -132,6 +138,70 @@ def validate_vae(vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_
     return avg_val, val_metrics, val_batches
 
 
+@torch.no_grad()
+def patient_level_vae_metrics(vae, val_ds, device, batch_size: int, max_patients=None) -> dict:
+    """Patient-level mae_hu / psnr / ms_ssim using SynthRAD ImageMetrics.
+
+    Mirrors `_eval_decoded_metrics` in unetConcatControlPACA.py so VAE training
+    curves are on the same scale as D1 training curves and the leaderboard.
+    """
+    metrics_obj = ImageMetrics()
+    slice_ds = val_ds.slice_ds  # underlying SliceDataset
+
+    n_vols = len(slice_ds._vols)
+    if max_patients is not None:
+        n_vols = min(n_vols, int(max_patients))
+
+    totals = {"mae": 0.0, "psnr": 0.0, "ms_ssim": 0.0}
+    region_totals = {name: {"mae": 0.0, "psnr": 0.0, "ms_ssim": 0.0, "n": 0}
+                     for name in REGION_NAMES.values()}
+    n_patients = 0
+
+    vae.eval()
+    for vi in range(n_vols):
+        ct_full, _cbct, mask_full, rid = slice_ds._vols[vi]
+        Z = ct_full.shape[0]
+        recon_full = np.empty_like(ct_full)
+        for z0 in range(0, Z, batch_size):
+            z1 = min(z0 + batch_size, Z)
+            ct_b = torch.from_numpy(ct_full[z0:z1]).unsqueeze(1).to(device)
+            mu, _ = vae.encode(ct_b)
+            recon = vae.decode(mu).clamp(-1.0, 1.0)
+            recon_full[z0:z1] = recon.squeeze(1).detach().cpu().numpy()
+
+        body = (mask_full > 0.5)
+        recon_full = recon_full * body + (-1.0) * (1.0 - body)
+
+        ct_hu  = to_hu(ct_full)
+        rec_hu = to_hu(recon_full)
+        scored = metrics_obj.score_patient(ct_hu, rec_hu, mask_full)
+
+        totals["mae"]     += scored["mae"]
+        totals["psnr"]    += scored["psnr"]
+        totals["ms_ssim"] += scored["ms_ssim"]
+        n_patients += 1
+
+        name = REGION_NAMES[int(rid)]
+        region_totals[name]["mae"]     += scored["mae"]
+        region_totals[name]["psnr"]    += scored["psnr"]
+        region_totals[name]["ms_ssim"] += scored["ms_ssim"]
+        region_totals[name]["n"]       += 1
+
+    n_safe = max(n_patients, 1)
+    out = {
+        "val/mae_hu_vae":  totals["mae"]     / n_safe,
+        "val/psnr_vae":    totals["psnr"]    / n_safe,
+        "val/ms_ssim_vae": totals["ms_ssim"] / n_safe,
+        "val/n_patients":  float(n_patients),
+    }
+    for name, t in region_totals.items():
+        if t["n"]:
+            out[f"val/mae_hu_vae_{name}"]  = t["mae"]     / t["n"]
+            out[f"val/psnr_vae_{name}"]    = t["psnr"]    / t["n"]
+            out[f"val/ms_ssim_vae_{name}"] = t["ms_ssim"] / t["n"]
+    return out
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train VAE on preprocessed CT slices")
     p.add_argument("--manifest", default="data/manifest.csv")
@@ -158,7 +228,10 @@ def parse_args():
     p.add_argument("--kl-weight", type=float, default=1e-5)
     p.add_argument("--l1-weight", type=float, default=1.0)
     p.add_argument("--max-train-batches", type=int, default=None)
-    p.add_argument("--max-val-batches", type=int, default=None)
+    p.add_argument("--max-val-batches", type=int, default=None,
+                   help="cap val batches for the loss-only val pass (smoke test)")
+    p.add_argument("--max-val-patients", type=int, default=None,
+                   help="cap patients for the patient-level HU eval; None = full val (~23)")
     p.add_argument("--vis-every", type=int, default=10,
                    help="upload fixed train/validation reconstructions to WandB every N epochs; 0 disables")
     p.add_argument("--vis-num-samples", type=int, default=4,
@@ -180,6 +253,10 @@ def main():
     print(f"Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Device  : {device}")
     print("=" * 60)
+
+    # Fail-fast if data was preprocessed with a different HU clip range.
+    validate_manifest_clip(args.manifest, "train", CLIP_MIN, CLIP_MAX)
+    validate_manifest_clip(args.manifest, "val",   CLIP_MIN, CLIP_MAX)
 
     augmentation = not args.no_augment
     train_ds = CTOnlyDataset(args.manifest, "train", augmentation=augmentation)
@@ -415,6 +492,21 @@ def main():
                     amp_enabled=amp_enabled,
                     max_samples=args.vis_num_samples,
                     prefix="val",
+                )
+                # Patient-level SynthRAD-aligned metrics for tracking the HU-space floor.
+                hu_metrics = patient_level_vae_metrics(
+                    vae=vae,
+                    val_ds=val_ds,
+                    device=device,
+                    batch_size=args.batch_size,
+                    max_patients=args.max_val_patients,
+                )
+                wandb_logger.log_metrics({"epoch": epoch_num, **hu_metrics}, step=epoch_num)
+                print(
+                    f"  [hu] mae_hu_vae={hu_metrics['val/mae_hu_vae']:.2f}  "
+                    f"psnr_vae={hu_metrics['val/psnr_vae']:.2f}  "
+                    f"ms_ssim_vae={hu_metrics['val/ms_ssim_vae']:.4f}  "
+                    f"(n={int(hu_metrics['val/n_patients'])})"
                 )
 
             if args.early_stopping and bad_epochs >= args.early_stopping:

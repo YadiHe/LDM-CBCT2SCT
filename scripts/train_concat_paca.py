@@ -108,6 +108,14 @@ def parse_args():
                    help="γ for Min-SNR weighting; weight=min(SNR,γ)/SNR")
     p.add_argument("--cosine-min-lr-ratio", type=float, default=0.1,
                    help="min LR as ratio of peak LR for sd-warmup-cosine schedule")
+    p.add_argument("--noise-schedule", choices=["linear", "cosine"], default="linear",
+                   help="beta noise schedule: linear (DDPM) or cosine (iDDPM, Nichol & Dhariwal 2021)")
+    p.add_argument("--prediction-type", choices=["epsilon", "v_prediction"], default="epsilon",
+                   help="diffusion prediction target: epsilon (DDPM) or v_prediction (SD2/SDXL)")
+    p.add_argument("--timestep-sampling", choices=["uniform", "logit_normal"], default="uniform",
+                   help="timestep sampling distribution: uniform or logit_normal (SD3-style, focuses on middle t)")
+    p.add_argument("--latent-scale", type=float, default=1.0,
+                   help="scale applied to VAE latents to normalise std to ~1.0; measured=1.3995 for vae_best.pth")
     p.add_argument("--early-stopping", type=int,   default=50,
                    help="stop if val loss doesn't improve for this many epochs")
     p.add_argument("--max-train-batches", type=int, default=None,
@@ -365,6 +373,10 @@ def main():
                 "use_min_snr_weight": args.use_min_snr_weight,
                 "min_snr_gamma": args.min_snr_gamma,
                 "cosine_min_lr_ratio": args.cosine_min_lr_ratio,
+                "noise_schedule": args.noise_schedule,
+                "prediction_type": args.prediction_type,
+                "timestep_sampling": args.timestep_sampling,
+                "latent_scale": args.latent_scale,
                 "eval_every": args.eval_every,
                 "early_stopping": args.early_stopping,
                 "max_train_batches": args.max_train_batches,
@@ -421,6 +433,10 @@ def main():
             use_min_snr_weight=args.use_min_snr_weight,
             min_snr_gamma=args.min_snr_gamma,
             cosine_min_lr_ratio=args.cosine_min_lr_ratio,
+            noise_schedule=args.noise_schedule,
+            prediction_type=args.prediction_type,
+            timestep_sampling=args.timestep_sampling,
+            latent_scale=args.latent_scale,
         )
     finally:
         if wandb_logger:

@@ -14,11 +14,16 @@ from models.blocks import ControlNetPACAUpBlock, nonlinearity, Normalize, Timest
 from models.degradationRemoval import degradation_loss
 from models.unet import noise_loss
 from utils.losses import PerceptualLoss, SsimLoss
+from utils.hu import CLIP_MIN, CLIP_MAX, to_hu
+from utils.image_metrics import ImageMetrics
 from torch.optim import AdamW
 
-CLIP_MIN = -1024.0
-CLIP_MAX = 1500.0
 REGION_NAMES = {0: "BB", 1: "AB", 2: "HN", 3: "TH"}
+
+# Latent scaling: normalises VAE latent std to ~1.0 so the cosine SNR schedule
+# operates as designed. Measured on train set: raw std ≈ 0.714.
+# Default 1.0 keeps existing behaviour; E1+ uses 1.3995.
+_DEFAULT_LATENT_SCALE = 1.0
 
 
 class LatentControlAdapter(nn.Module):
@@ -266,7 +271,9 @@ class UNetConcatControlPACA(nn.Module):
         paca_4 = (additional_down_res_4_1, additional_down_res_4_2) if use_paca else None
         paca_3 = (additional_down_res_3_1, additional_down_res_3_2) if use_paca else None
         paca_2 = (additional_down_res_2_1, additional_down_res_2_2) if use_paca else None
-        paca_1 = (additional_down_res_1_1, additional_down_res_1_2) if use_paca else None
+        # 64×64 PACA disabled: O(N²) attention at N=4096 is prohibitively expensive;
+        # consistent with attn_res_64=False for self-attention.
+        paca_1 = None
 
         if control_paca and use_add:
             h = h + middle_paca_control_residual
@@ -329,10 +336,6 @@ def load_unet_concat_control_paca(unet_save_path=None, paca_save_path=None, unet
 
     return unetConcatControlPACA
 
-def _to_hu(x_norm):
-    return ((x_norm + 1.0) * 0.5 * (CLIP_MAX - CLIP_MIN)) + CLIP_MIN
-
-
 def _to_image01(x_norm):
     return ((x_norm + 1.0) * 0.5).clamp(0.0, 1.0)
 
@@ -363,16 +366,10 @@ def _make_comparison_panel(cbct, ct, sct, error):
     return np.concatenate([panels[0], separator, panels[1], separator, panels[2], separator, panels[3]], axis=1)
 
 
-def _encode_vae(vae, x, latent_mode="mu"):
+def _encode_vae(vae, x, latent_mode="mu", latent_scale=1.0):
     mu, logvar = vae.encode(x)
-    if latent_mode == "sample":
-        return vae.reparameterize(mu, logvar)
-    return mu
-
-
-def _masked_psnr(pred, target, mask):
-    mse = ((pred - target) ** 2 * mask).sum() / mask.sum().clamp_min(1.0)
-    return float(20.0 * torch.log10(torch.tensor(2.0, device=pred.device)) - 10.0 * torch.log10(mse.clamp_min(1e-12)))
+    z = vae.reparameterize(mu, logvar) if latent_mode == "sample" else mu
+    return z * latent_scale
 
 
 def _masked_mse_loss(pred, target, mask):
@@ -401,35 +398,21 @@ def _masked_l1_loss_per_sample(pred, target, mask):
     return abs_diff.sum(dim=[1, 2, 3]) / per_denom
 
 
-def _min_snr_weights(t, alpha_cumprod, gamma=5.0):
-    """Min-SNR-γ weights for epsilon-prediction L1/L2 loss.
-    Reference: Hang et al. 2023, "Efficient Diffusion Training via Min-SNR Weighting Strategy".
-    Per-sample weight: w(t) = min(SNR_t, gamma) / SNR_t,  SNR_t = a_t / (1 - a_t)
+def _min_snr_weights(t, alpha_cumprod, gamma=5.0, prediction_type="epsilon"):
+    """Min-SNR-γ weights (Hang et al. 2023, Eqs. 8-9).
+    epsilon: w = min(SNR, γ) / SNR
+    v_prediction: w = min(SNR+1, γ+1) / (SNR+1)
     """
     a = alpha_cumprod[t].clamp_min(1e-8)
     snr = a / (1.0 - a).clamp_min(1e-8)
-    w = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
+    if prediction_type == "v_prediction":
+        denom = snr + 1.0
+        w = torch.minimum(denom, torch.full_like(denom, gamma + 1.0)) / denom
+    else:
+        w = torch.minimum(snr, torch.full_like(snr, gamma)) / snr
     return w
 
 
-def _masked_ssim(pred, target, mask):
-    try:
-        from skimage.metrics import structural_similarity
-    except ImportError:
-        return float("nan")
-    pred_np = pred.detach().float().cpu().numpy()
-    target_np = target.detach().float().cpu().numpy()
-    mask_np = mask.detach().float().cpu().numpy()
-    values = []
-    for p, t, m in zip(pred_np, target_np, mask_np):
-        p2 = p.squeeze()
-        t2 = t.squeeze()
-        m2 = m.squeeze() > 0.5
-        # Keep padding identical so SSIM is not rewarded or punished by background.
-        p2 = np.where(m2, p2, -1.0)
-        t2 = np.where(m2, t2, -1.0)
-        values.append(structural_similarity(t2, p2, data_range=2.0, win_size=11))
-    return float(np.mean(values)) if values else float("nan")
 
 
 def _control_inputs(cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source):
@@ -460,8 +443,9 @@ def _predict_noise(unet, controlnet, z_noisy, cbct_z, t, control_feature, region
 
 def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
                  use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, steps, amp_enabled,
-                 amp_dtype="fp16", sampler_init="noise", sampler_t_start=999, sampler_alpha=1.0):
-    cbct_z = _encode_vae(vae, cbct_img, latent_mode)
+                 amp_dtype="fp16", sampler_init="noise", sampler_t_start=999, sampler_alpha=1.0,
+                 prediction_type="epsilon", latent_scale=1.0):
+    cbct_z = _encode_vae(vae, cbct_img, latent_mode, latent_scale)
     control_feature, _ = _control_inputs(cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source)
     generator = torch.Generator(device=cbct_img.device).manual_seed(0)
     sampler_t_start = int(min(max(sampler_t_start, 0), diffusion.timesteps - 1))
@@ -478,61 +462,115 @@ def _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, c
     for idx, t_scalar in enumerate(timesteps):
         t = torch.full((cbct_z.size(0),), int(t_scalar.item()), device=cbct_z.device, dtype=torch.long)
         with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
-            eps = _predict_noise(unet, controlnet, x, cbct_z, t, control_feature, region_id, use_controlnet, controlnet_fusion)
+            model_out = _predict_noise(unet, controlnet, x, cbct_z, t, control_feature, region_id, use_controlnet, controlnet_fusion)
         alpha_t = diffusion.alpha_cumprod[t_scalar].view(1, 1, 1, 1)
-        pred_x0 = (x - torch.sqrt(1.0 - alpha_t) * eps) / torch.sqrt(alpha_t)
+        sqrt_at = torch.sqrt(alpha_t)
+        sqrt_1mat = torch.sqrt(1.0 - alpha_t)
+        if prediction_type == "v_prediction":
+            pred_x0 = sqrt_at * x - sqrt_1mat * model_out
+            eps = sqrt_at * model_out + sqrt_1mat * x
+        else:
+            eps = model_out
+            pred_x0 = (x - sqrt_1mat * eps) / sqrt_at
         if idx == len(timesteps) - 1:
             x = pred_x0
         else:
             prev_t = timesteps[idx + 1]
             alpha_prev = diffusion.alpha_cumprod[prev_t].view(1, 1, 1, 1)
             x = torch.sqrt(alpha_prev) * pred_x0 + torch.sqrt(1.0 - alpha_prev) * eps
-    return vae.decode(x).clamp(-1.0, 1.0)
+    return vae.decode(x / latent_scale).clamp(-1.0, 1.0)
 
 
 def _eval_decoded_metrics(vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                          amp_enabled, amp_dtype="fp16", max_val_batches=None, sampler_init="noise", sampler_t_start=999,
-                          sampler_alpha=1.0):
-    totals = {"mae_hu": 0.0, "psnr": 0.0, "ssim": 0.0}
-    region_totals = {name: [0.0, 0] for name in REGION_NAMES.values()}
-    count = 0
-    with torch.no_grad():
-        for i, (ct_img, cbct_img, mask, region_id) in enumerate(val_loader):
-            if max_val_batches is not None and i >= max_val_batches:
-                break
-            ct_img = ct_img.to(device)
-            cbct_img = cbct_img.to(device)
-            mask = mask.to(device)
-            region_id = region_id.to(device)
-            sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_img, region_id,
-                               use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                               amp_enabled, amp_dtype, sampler_init, sampler_t_start, sampler_alpha)
-            sct = sct * mask + (-1.0) * (1.0 - mask)
-            mae_per = ((_to_hu(sct) - _to_hu(ct_img)).abs() * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp_min(1.0)
-            psnr = _masked_psnr(sct, ct_img, mask)
-            ssim = _masked_ssim(sct, ct_img, mask)
-            batch_n = ct_img.size(0)
-            totals["mae_hu"] += float(mae_per.mean()) * batch_n
-            totals["psnr"] += psnr * batch_n
-            totals["ssim"] += ssim * batch_n
-            count += batch_n
-            for mae, rid in zip(mae_per.detach().cpu().tolist(), region_id.detach().cpu().tolist()):
-                name = REGION_NAMES[int(rid)]
-                region_totals[name][0] += float(mae)
-                region_totals[name][1] += 1
+                          amp_enabled, amp_dtype="fp16", max_val_patients=None, sampler_init="noise", sampler_t_start=999,
+                          sampler_alpha=1.0, prediction_type="epsilon", latent_scale=1.0):
+    """Patient-level 3D decoded metrics aligned to SynthRAD official ImageMetrics.
 
-    metrics = {f"val/{k}": v / max(count, 1) for k, v in totals.items()}
-    for name, (total, n) in region_totals.items():
-        if n:
-            metrics[f"val/mae_hu_{name}"] = total / n
+    For each val patient:
+      1. DDIM-sample sCT for all body-bearing slices (mask sum >= 1).
+      2. Set air slices and out-of-mask voxels to -1.0 (== -1024 HU after to_hu).
+      3. Convert ct/sct from [-1, 1] back to HU (using v2 CLIP range).
+      4. Score patient with ImageMetrics: MAE / PSNR (data_range=4024) / masked MS-SSIM.
+      5. Average across patients (and per-region).
+
+    `max_val_patients` caps the number of val patients to process — useful for
+    smoke testing. None = full val set (typically 23 patients).
+    """
+    metrics_obj = ImageMetrics()
+    val_dataset = val_loader.dataset
+    inference_batch_size = val_loader.batch_size or 16
+
+    totals = {"mae_hu": 0.0, "psnr": 0.0, "ms_ssim": 0.0}
+    region_totals = {name: {"mae_hu": 0.0, "psnr": 0.0, "ms_ssim": 0.0, "n": 0}
+                     for name in REGION_NAMES.values()}
+    n_patients = 0
+
+    n_vols = len(val_dataset._vols)
+    if max_val_patients is not None:
+        n_vols = min(n_vols, int(max_val_patients))
+
+    with torch.no_grad():
+        for vi in range(n_vols):
+            ct_full, cbct_full, mask_full, rid = val_dataset._vols[vi]
+            sct_volume = np.full(ct_full.shape, -1.0, dtype=np.float32)
+
+            # Inference only on slices that contain body voxels; air slices stay -1.0.
+            z_with_body = [z for z in range(ct_full.shape[0]) if mask_full[z].sum() >= 1]
+            if not z_with_body:
+                continue
+
+            for bs in range(0, len(z_with_body), inference_batch_size):
+                z_batch = z_with_body[bs:bs + inference_batch_size]
+                ct_b   = torch.from_numpy(ct_full[z_batch]).unsqueeze(1).to(device)
+                cbct_b = torch.from_numpy(cbct_full[z_batch]).unsqueeze(1).to(device)
+                mask_b = torch.from_numpy(mask_full[z_batch]).unsqueeze(1).to(device)
+                rid_b  = torch.full((len(z_batch),), int(rid), dtype=torch.long, device=device)
+
+                sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion,
+                                   cbct_b, rid_b, use_controlnet, use_dr, control_source,
+                                   controlnet_fusion, latent_mode, ddim_steps, amp_enabled, amp_dtype,
+                                   sampler_init, sampler_t_start, sampler_alpha,
+                                   prediction_type, latent_scale)
+                sct = sct * mask_b + (-1.0) * (1.0 - mask_b)
+                sct_np = sct.detach().cpu().numpy().squeeze(1)
+                for local_i, z in enumerate(z_batch):
+                    sct_volume[z] = sct_np[local_i]
+
+            ct_hu  = to_hu(ct_full)
+            sct_hu = to_hu(sct_volume)
+            scored = metrics_obj.score_patient(ct_hu, sct_hu, mask_full)
+
+            totals["mae_hu"]  += scored["mae"]
+            totals["psnr"]    += scored["psnr"]
+            totals["ms_ssim"] += scored["ms_ssim"]
+            n_patients += 1
+
+            name = REGION_NAMES[int(rid)]
+            region_totals[name]["mae_hu"]  += scored["mae"]
+            region_totals[name]["psnr"]    += scored["psnr"]
+            region_totals[name]["ms_ssim"] += scored["ms_ssim"]
+            region_totals[name]["n"]       += 1
+
+    n_safe = max(n_patients, 1)
+    metrics = {
+        "val/mae_hu":  totals["mae_hu"]  / n_safe,
+        "val/psnr":    totals["psnr"]    / n_safe,
+        "val/ms_ssim": totals["ms_ssim"] / n_safe,
+        "val/n_patients": float(n_patients),
+    }
+    for name, t in region_totals.items():
+        if t["n"]:
+            metrics[f"val/mae_hu_{name}"]  = t["mae_hu"]  / t["n"]
+            metrics[f"val/psnr_{name}"]    = t["psnr"]    / t["n"]
+            metrics[f"val/ms_ssim_{name}"] = t["ms_ssim"] / t["n"]
     return metrics
 
 
 def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                           use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
                           amp_enabled, amp_dtype, wandb_logger, epoch, max_images=8, sampler_init="noise",
-                          sampler_t_start=999, sampler_alpha=1.0):
+                          sampler_t_start=999, sampler_alpha=1.0, prediction_type="epsilon", latent_scale=1.0):
     if not wandb_logger or fixed_val_batch is None:
         return
     ct_img, cbct_img, mask, region_id, captions = fixed_val_batch
@@ -547,9 +585,10 @@ def _log_fixed_val_images(vae, unet, controlnet, dr_module, control_adapter, dif
         with torch.no_grad():
             sct = _ddim_sample(vae, unet, controlnet, dr_module, control_adapter, diffusion, cbct_chunk, region_chunk,
                                use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                               amp_enabled, amp_dtype, sampler_init, sampler_t_start, sampler_alpha)
+                               amp_enabled, amp_dtype, sampler_init, sampler_t_start, sampler_alpha,
+                               prediction_type, latent_scale)
         sct = sct * mask_chunk + (-1.0) * (1.0 - mask_chunk)
-        err = ((_to_hu(sct) - _to_hu(ct_chunk)).abs() * mask_chunk).clamp(0, 300) / 300.0
+        err = ((to_hu(sct) - to_hu(ct_chunk)).abs() * mask_chunk).clamp(0, 300) / 300.0
         for local_i in range(ct_chunk.size(0)):
             i = start + local_i
             caption = captions[i] if captions else f"sample_{i}"
@@ -606,6 +645,10 @@ def train_unet_concat_control_paca(
     use_min_snr_weight=False,
     min_snr_gamma=5.0,
     cosine_min_lr_ratio=0.1,
+    noise_schedule="linear",
+    prediction_type="epsilon",
+    timestep_sampling="uniform",
+    latent_scale=1.0,
 ):
     if loss_type not in ("mse", "l1"):
         raise ValueError("loss_type must be 'mse' or 'l1'")
@@ -618,6 +661,10 @@ def train_unet_concat_control_paca(
         raise ValueError("sampler_init must be one of: noise, cbct")
     if lr_schedule not in ("sd-warmup-constant", "sd-warmup-cosine", "constant"):
         raise ValueError("lr_schedule must be one of: sd-warmup-constant, constant")
+    if prediction_type not in ("epsilon", "v_prediction"):
+        raise ValueError("prediction_type must be 'epsilon' or 'v_prediction'")
+    if timestep_sampling not in ("uniform", "logit_normal"):
+        raise ValueError("timestep_sampling must be 'uniform' or 'logit_normal'")
     if use_dr and (not use_controlnet or control_source != "dr"):
         raise ValueError("--use-dr is only supported with --use-controlnet --control-source dr")
     if use_controlnet and control_source == "dr" and dr_module is None:
@@ -701,7 +748,7 @@ def train_unet_concat_control_paca(
         print(f"EMA resumed from: {ema_path}")
     if ema is not None:
         print(f"EMA enabled: decay={ema.decay}, modules={','.join(ema.modules.keys())}")
-    diffusion = Diffusion(device, timesteps=1000)
+    diffusion = Diffusion(device, timesteps=1000, noise_schedule=noise_schedule)
 
     best_val_loss = float('inf')
     early_stopping_counter = 0
@@ -737,22 +784,31 @@ def train_unet_concat_control_paca(
             region_id = region_id.to(device)
 
             with torch.no_grad(), autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
-                z_ct = _encode_vae(vae, ct_img, latent_mode)
-                cbct_z = _encode_vae(vae, cbct_img, latent_mode)
+                z_ct = _encode_vae(vae, ct_img, latent_mode, latent_scale)
+                cbct_z = _encode_vae(vae, cbct_img, latent_mode, latent_scale)
 
             with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
                 control_feature, intermediate_preds = _control_inputs(
                     cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source
                 )
-                t = diffusion.sample_timesteps(z_ct.size(0))
+                if timestep_sampling == "logit_normal":
+                    t = diffusion.sample_timesteps_logit_normal(z_ct.size(0))
+                else:
+                    t = diffusion.sample_timesteps(z_ct.size(0))
                 noise = torch.randn_like(z_ct)
                 z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
-                pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
+                model_pred = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
                                             use_controlnet, controlnet_fusion)
+                if prediction_type == "v_prediction":
+                    a = diffusion.alpha_cumprod[t].view(-1, 1, 1, 1).to(z_ct.dtype)
+                    target = torch.sqrt(a) * noise - torch.sqrt(1.0 - a) * z_ct
+                else:
+                    target = noise
                 latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                per_sample_loss = _per_sample_diff_loss_fn(pred_noise, noise, latent_mask)
+                per_sample_loss = _per_sample_diff_loss_fn(model_pred, target, latent_mask)
                 if use_min_snr_weight:
-                    snr_w = _min_snr_weights(t, diffusion.alpha_cumprod, gamma=min_snr_gamma).to(per_sample_loss.dtype)
+                    snr_w = _min_snr_weights(t, diffusion.alpha_cumprod, gamma=min_snr_gamma,
+                                             prediction_type=prediction_type).to(per_sample_loss.dtype)
                     loss_diff = (per_sample_loss * snr_w).mean()
                 else:
                     loss_diff = per_sample_loss.mean()
@@ -842,20 +898,26 @@ def train_unet_concat_control_paca(
                     region_id = region_id.to(device)
 
                     with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
-                        z_ct = _encode_vae(vae, ct_img, latent_mode)
-                        cbct_z = _encode_vae(vae, cbct_img, latent_mode)
+                        z_ct = _encode_vae(vae, ct_img, latent_mode, latent_scale)
+                        cbct_z = _encode_vae(vae, cbct_img, latent_mode, latent_scale)
                         control_feature, intermediate_preds = _control_inputs(
                             cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source
                         )
                         t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
                         noise = torch.randn(z_ct.shape, device=z_ct.device, dtype=z_ct.dtype, generator=val_generator)
                         z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
-                        pred_noise = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
+                        model_pred = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
                                                     use_controlnet, controlnet_fusion)
+                        if prediction_type == "v_prediction":
+                            a = diffusion.alpha_cumprod[t].view(-1, 1, 1, 1).to(z_ct.dtype)
+                            target = torch.sqrt(a) * noise - torch.sqrt(1.0 - a) * z_ct
+                        else:
+                            target = noise
                         latent_mask = F.avg_pool2d(mask.float(), kernel_size=4, stride=4) > 0.5
-                        per_sample_loss = _per_sample_diff_loss_fn(pred_noise, noise, latent_mask)
+                        per_sample_loss = _per_sample_diff_loss_fn(model_pred, target, latent_mask)
                         if use_min_snr_weight:
-                            snr_w = _min_snr_weights(t, diffusion.alpha_cumprod, gamma=min_snr_gamma).to(per_sample_loss.dtype)
+                            snr_w = _min_snr_weights(t, diffusion.alpha_cumprod, gamma=min_snr_gamma,
+                                                     prediction_type=prediction_type).to(per_sample_loss.dtype)
                             loss_diff = (per_sample_loss * snr_w).mean()
                         else:
                             loss_diff = per_sample_loss.mean()
@@ -915,11 +977,14 @@ def train_unet_concat_control_paca(
             extra_metrics.update(latent_stats)
 
             if (epoch + 1) % max(eval_every, 1) == 0:
+                # max_val_batches doubles as max_val_patients here — the patient-level
+                # eval iterates patients, not batches. None = full val set (~23 patients).
                 decoded_metrics = _eval_decoded_metrics(
                     vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
-                    amp_enabled, amp_dtype, max_val_batches=max_val_batches, sampler_init=sampler_init,
+                    amp_enabled, amp_dtype, max_val_patients=max_val_batches, sampler_init=sampler_init,
                     sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
+                    prediction_type=prediction_type, latent_scale=latent_scale,
                 )
                 extra_metrics.update(decoded_metrics)
                 _log_fixed_val_images(
@@ -927,6 +992,7 @@ def train_unet_concat_control_paca(
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
                     amp_enabled, amp_dtype, wandb_logger, epoch + 1, max_images=fixed_val_max_images, sampler_init=sampler_init,
                     sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
+                    prediction_type=prediction_type, latent_scale=latent_scale,
                 )
 
             if wandb_logger:

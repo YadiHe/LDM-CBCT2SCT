@@ -2,7 +2,7 @@
 """
 预处理脚本：synthRAD2023 (Brain) + synthRAD2025 (AB/HN/TH)
 
-流程: MONAI Load/Transform → HU clip → 前景裁剪 → 等比缩放+中心 Padding → 归一化 → 保存 MHA
+流程: 一次性加载 → HU clip → 前景裁剪 → mask 外置空气 → 等比缩放+中心 Padding → 归一化 → 保存 MHA
 输出: data/preprocessed/{pid}/*.mha  +  manifest.csv
 
 用法:
@@ -45,10 +45,10 @@ except ModuleNotFoundError as e:
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-CLIP_MIN = -1024.0
-CLIP_MAX  =  1500.0
-TARGET    = 256
-MARGIN    = 10
+from utils.hu import CLIP_MIN, CLIP_MAX  # single source of truth
+
+TARGET = 256
+MARGIN = 10
 
 # Patient-ID prefix → region label
 REGION_PREFIXES = [
@@ -103,15 +103,35 @@ def get_patient_paths(patient_dir: str) -> dict:
     }
 
 
-def read_geometry(path: str) -> dict:
-    """Read ITK geometry in x/y/z order."""
-    img = sitk.ReadImage(path)
-    return {
-        "spacing": list(img.GetSpacing()),
-        "origin": list(img.GetOrigin()),
-        "direction": list(img.GetDirection()),
-        "size": list(img.GetSize()),
+def load_patient_volumes(patient_paths: dict):
+    """
+    Read CT/CBCT/mask once, validate same voxel grid, and return:
+        arrays   : dict[str, np.ndarray] of shape (1, Z, H, W) in channel-first
+        geometry : dict with x/y/z spacing/origin/direction/size from CT
+
+    Replaces previous read_geometry + validate_same_geometry + LoadSITKArrayd
+    chain (eliminates 6+ redundant SimpleITK reads per patient).
+    """
+    images = {k: sitk.ReadImage(p) for k, p in patient_paths.items()}
+    ref = images["ct"]
+    ref_geom = (ref.GetSize(), ref.GetSpacing(), ref.GetOrigin(), ref.GetDirection())
+    for k, img in images.items():
+        if k == "ct":
+            continue
+        if (img.GetSize(), img.GetSpacing(), img.GetOrigin(), img.GetDirection()) != ref_geom:
+            raise ValueError(
+                f"{k} geometry does not match CT: "
+                f"ct(size={ref.GetSize()}, spacing={ref.GetSpacing()}, origin={ref.GetOrigin()}) vs "
+                f"{k}(size={img.GetSize()}, spacing={img.GetSpacing()}, origin={img.GetOrigin()})"
+            )
+    arrays = {k: sitk.GetArrayFromImage(img)[None] for k, img in images.items()}
+    geometry = {
+        "spacing": list(ref.GetSpacing()),
+        "origin": list(ref.GetOrigin()),
+        "direction": list(ref.GetDirection()),
+        "size": list(ref.GetSize()),
     }
+    return arrays, geometry
 
 
 def save_vol(arr: np.ndarray, path: str, geometry: dict):
@@ -133,17 +153,6 @@ def _as_numpy(x) -> np.ndarray:
     return np.asarray(x)
 
 
-class LoadSITKArrayd(MapTransform):
-    """Load medical volumes as channel-first (1, Z, H, W) arrays."""
-
-    def __call__(self, data):
-        d = dict(data)
-        for key in self.keys:
-            arr = sitk.GetArrayFromImage(sitk.ReadImage(d[key]))
-            d[key] = arr[None]
-        return d
-
-
 def get_xy_bbox(mask: np.ndarray):
     """
     Union bounding box of body mask across all slices, expanded by MARGIN.
@@ -151,13 +160,13 @@ def get_xy_bbox(mask: np.ndarray):
     Returns (h0, h1, w0, w1) as slice end-points.
     """
     D, H, W = mask.shape
-    proj = mask.max(axis=0)          # (H, W)
+    proj = mask.max(axis=0)
     rows = np.any(proj, axis=1)
     cols = np.any(proj, axis=0)
     h_idx = np.where(rows)[0]
     w_idx = np.where(cols)[0]
     if len(h_idx) == 0 or len(w_idx) == 0:
-        return 0, H, 0, W            # fallback: whole image
+        return 0, H, 0, W
     h0 = max(0, h_idx[0]  - MARGIN)
     h1 = min(H, h_idx[-1] + 1 + MARGIN)
     w0 = max(0, w_idx[0]  - MARGIN)
@@ -185,6 +194,24 @@ class MaskForegroundCropd(MapTransform):
         return d
 
 
+class SetAirBackgroundd(MapTransform):
+    """Set voxels outside `mask_key` foreground to `air_val` for each key in `keys`."""
+
+    def __init__(self, keys, mask_key="mask", air_val=-1024.0):
+        super().__init__(keys)
+        self.mask_key = mask_key
+        self.air_val = float(air_val)
+
+    def __call__(self, data):
+        d = dict(data)
+        # mask is (1, Z, H, W); broadcasts directly against image (1, Z, H, W).
+        body = d[self.mask_key] > 0.5
+        for key in self.keys:
+            img = d[key]
+            d[key] = torch.where(body, img, img.new_full((), self.air_val))
+        return d
+
+
 class ResizeWithAspectRatioAndPadd(MapTransform):
     """Resize long side to target and center-pad short side to target."""
 
@@ -201,7 +228,7 @@ class ResizeWithAspectRatioAndPadd(MapTransform):
         new_H, new_W = round(H * scale), round(W * scale)
         pad_h, pad_w = self.target - new_H, self.target - new_W
 
-        img_keys = [k for k in self.keys if k != self.mask_key]
+        img_keys  = [k for k in self.keys if k != self.mask_key]
         mask_keys = [k for k in self.keys if k == self.mask_key]
 
         if img_keys:
@@ -252,31 +279,42 @@ class BinarizeMaskd(MapTransform):
 
 
 def build_preprocess_transform():
+    """
+    Local pipeline: clip → crop to body bbox → set background to air →
+    resize+pad → re-apply air background → normalize.
+
+    Two SetAirBackground passes:
+      - pre-resize:  zeros out non-body voxels (table/scatter/artifacts) in the
+                     original grid before bilinear resize blurs them inward.
+      - post-resize: cleans the 1-2 voxel rim where bilinear (image) and nearest
+                     (mask) resampling disagree at sub-pixel level, leaving a
+                     few hundred ppm of "bleed" voxels with non-air CT.
+
+    Inputs come in as channel-first (1, Z, H, W) numpy arrays — already loaded
+    by `load_patient_volumes`, so no IO transform is needed at the head.
+    """
     return Compose([
-        LoadSITKArrayd(keys=["ct", "cbct", "mask"]),
         EnsureTyped(keys=["ct", "cbct"], dtype=torch.float32),
         EnsureTyped(keys=["mask"], dtype=torch.uint8),
         ScaleIntensityRanged(
             keys=["ct", "cbct"],
-            a_min=CLIP_MIN,
-            a_max=CLIP_MAX,
-            b_min=CLIP_MIN,
-            b_max=CLIP_MAX,
+            a_min=CLIP_MIN, a_max=CLIP_MAX,
+            b_min=CLIP_MIN, b_max=CLIP_MAX,
             clip=True,
         ),
         MaskForegroundCropd(keys=["ct", "cbct", "mask"], source_key="mask", margin=MARGIN),
+        SetAirBackgroundd(keys=["ct", "cbct"], mask_key="mask", air_val=CLIP_MIN),
         ResizeWithAspectRatioAndPadd(
             keys=["ct", "cbct", "mask"],
             target_size=TARGET,
             pad_value=CLIP_MIN,
             mask_key="mask",
         ),
+        SetAirBackgroundd(keys=["ct", "cbct"], mask_key="mask", air_val=CLIP_MIN),
         ScaleIntensityRanged(
             keys=["ct", "cbct"],
-            a_min=CLIP_MIN,
-            a_max=CLIP_MAX,
-            b_min=-1.0,
-            b_max=1.0,
+            a_min=CLIP_MIN, a_max=CLIP_MAX,
+            b_min=-1.0,     b_max=1.0,
             clip=True,
         ),
         BinarizeMaskd(keys=["mask"]),
@@ -284,29 +322,32 @@ def build_preprocess_transform():
 
 
 def build_global_transform():
+    """
+    Global pipeline: same as local minus the body bbox crop, used to feed full-FOV
+    CBCT into the global ControlNet branch. Mask is co-resized with CBCT so the
+    post-resize SetAirBackground can clean bilinear edge bleed.
+    """
     return Compose([
-        LoadSITKArrayd(keys=["cbct"]),
         EnsureTyped(keys=["cbct"], dtype=torch.float32),
+        EnsureTyped(keys=["mask"], dtype=torch.uint8),
         ScaleIntensityRanged(
             keys=["cbct"],
-            a_min=CLIP_MIN,
-            a_max=CLIP_MAX,
-            b_min=CLIP_MIN,
-            b_max=CLIP_MAX,
+            a_min=CLIP_MIN, a_max=CLIP_MAX,
+            b_min=CLIP_MIN, b_max=CLIP_MAX,
             clip=True,
         ),
+        SetAirBackgroundd(keys=["cbct"], mask_key="mask", air_val=CLIP_MIN),
         ResizeWithAspectRatioAndPadd(
-            keys=["cbct"],
+            keys=["cbct", "mask"],
             target_size=TARGET,
             pad_value=CLIP_MIN,
             mask_key="mask",
         ),
+        SetAirBackgroundd(keys=["cbct"], mask_key="mask", air_val=CLIP_MIN),
         ScaleIntensityRanged(
             keys=["cbct"],
-            a_min=CLIP_MIN,
-            a_max=CLIP_MAX,
-            b_min=-1.0,
-            b_max=1.0,
+            a_min=CLIP_MIN, a_max=CLIP_MAX,
+            b_min=-1.0,     b_max=1.0,
             clip=True,
         ),
     ])
@@ -320,8 +361,6 @@ def output_geometry(original: dict, meta: dict) -> dict:
     in_spacing = original["spacing"]
     out_spacing = [float(in_spacing[0] / scale), float(in_spacing[1] / scale), float(in_spacing[2])]
 
-    # Direction is row-major 3x3, spacing/origin are x/y/z. Offset accounts for
-    # crop in original pixels and padding in output pixels.
     direction = np.asarray(original["direction"], dtype=np.float64).reshape(3, 3)
     offset_index = np.asarray([
         bbox["w0"] * in_spacing[0] - rp["pad_left"] * out_spacing[0],
@@ -346,18 +385,17 @@ def restore_preprocessed_to_original(
     """
     Restore a preprocessed (Z, 256, 256) volume to the original (Z, H, W) grid.
 
-    This is intended for inference/QC symmetry: remove center padding, resize
-    back to the mask-crop shape, then paste into the original XY canvas.
+    Intended for inference/QC symmetry: remove center padding, resize back to the
+    mask-crop shape, then paste into the original XY canvas.
     """
     rp = preprocess_meta["resize_pad"]
     bbox = preprocess_meta["crop_bbox_xy"]
-    orig_size = preprocess_meta["original_geometry"]["size"]  # x/y/z
+    orig_size = preprocess_meta["original_geometry"]["size"]
     orig_w, orig_h, orig_z = int(orig_size[0]), int(orig_size[1]), int(orig_size[2])
     crop_h, crop_w = rp["crop_shape_hw"]
 
-    z = arr.shape[0]
-    if z != orig_z:
-        raise ValueError(f"Z mismatch: preprocessed has {z}, original metadata has {orig_z}")
+    if arr.shape[0] != orig_z:
+        raise ValueError(f"Z mismatch: preprocessed has {arr.shape[0]}, original metadata has {orig_z}")
 
     h0 = rp["pad_top"]
     h1 = arr.shape[1] - rp["pad_bottom"]
@@ -377,38 +415,43 @@ def restore_preprocessed_to_original(
     return restored
 
 
-def preprocess(patient_paths: dict, original_geometry: dict):
+def preprocess(arrays: dict, original_geometry: dict):
     """
-    Full preprocessing pipeline for one patient volume.
+    Full preprocessing pipeline for one patient's already-loaded volumes.
+
+    Args:
+        arrays: dict with keys "ct", "cbct", "mask", each shape (1, Z, H, W).
+        original_geometry: x/y/z spacing/origin/direction/size from the source CT.
 
     Returns:
-        ct_pp   : (D, 256, 256) float32, normalized [-1, 1]
-        cbct_pp : (D, 256, 256) float32, normalized [-1, 1]
-        mask_pp : (D, 256, 256) float32, binary {0, 1}
-        cbct_global : (D, 256, 256) float32, pre-crop full-body CBCT, normalized
+        ct_pp       : (Z, 256, 256) float32, normalized [-1, 1]
+        cbct_pp     : (Z, 256, 256) float32, normalized [-1, 1]
+        mask_pp     : (Z, 256, 256) float32, binary {0, 1}
+        cbct_global : (Z, 256, 256) float32, full-FOV CBCT, normalized [-1, 1]
+        meta        : preprocessing metadata (crop bbox, resize/pad, output geometries)
     """
-    data = {
-        **patient_paths,
-        "preprocess_meta": {
-            "clip": [CLIP_MIN, CLIP_MAX],
-            "margin": MARGIN,
-            "original_geometry": original_geometry,
-        },
+    base_meta = {
+        "clip": [CLIP_MIN, CLIP_MAX],
+        "margin": MARGIN,
+        "original_geometry": original_geometry,
     }
-    local = build_preprocess_transform()(data)
 
+    local_data = {
+        "ct": arrays["ct"],
+        "cbct": arrays["cbct"],
+        "mask": arrays["mask"],
+        "preprocess_meta": dict(base_meta),
+    }
+    local = build_preprocess_transform()(local_data)
+
+    orig_w, orig_h = int(original_geometry["size"][0]), int(original_geometry["size"][1])
     global_data = {
-        "cbct": patient_paths["cbct"],
+        "cbct": arrays["cbct"],
+        "mask": arrays["mask"],
         "preprocess_meta": {
-            "clip": [CLIP_MIN, CLIP_MAX],
+            **base_meta,
             "margin": 0,
-            "crop_bbox_xy": {
-                "h0": 0,
-                "h1": original_geometry["size"][1],
-                "w0": 0,
-                "w1": original_geometry["size"][0],
-            },
-            "original_geometry": original_geometry,
+            "crop_bbox_xy": {"h0": 0, "h1": orig_h, "w0": 0, "w1": orig_w},
         },
     }
     global_pp = build_global_transform()(global_data)
@@ -420,15 +463,20 @@ def preprocess(patient_paths: dict, original_geometry: dict):
         original_geometry,
         {
             "crop_bbox_xy": global_data["preprocess_meta"]["crop_bbox_xy"],
-            "resize_pad": global_pp["preprocess_meta"]["resize_pad"],
+            "resize_pad":   global_pp["preprocess_meta"]["resize_pad"],
         },
     )
 
-    def volume(key, d=local):
+    def vol(d, key):
         return _as_numpy(d[key][0]).astype(np.float32)
 
-    cbct_global = _as_numpy(global_pp["cbct"][0]).astype(np.float32)
-    return volume("ct"), volume("cbct"), volume("mask"), cbct_global, meta
+    return (
+        vol(local, "ct"),
+        vol(local, "cbct"),
+        vol(local, "mask"),
+        vol(global_pp, "cbct"),
+        meta,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +489,7 @@ def assign_splits(by_region: dict) -> list:
 
     Indices [0, n_tr) → train, [n_tr, n_tr+n_vl) → val, [n_tr+n_vl, end) → train.
     The trailing-train segment absorbs whatever remains after train+val so that no
-    GT-bearing patient is dropped. Returns list of dicts with keys:
-    patient_id, region, split, _dir
+    GT-bearing patient is dropped.
     """
     rows = []
     for region, pats in sorted(by_region.items()):
@@ -469,6 +516,26 @@ def parse_args():
     p.add_argument("--manifest", default="data/manifest.csv",
                    help="Output manifest CSV path")
     return p.parse_args()
+
+
+def _verify_air_background(ct_path: str, mask_path: str, pid: str, tol: float = 0.05) -> bool:
+    """Read back saved CT/mask and check mask==0 voxels are normalized air (≈ -1).
+
+    Returns True iff `max(bg) <= -1 + tol`. Prints a [check]/[verify-warn] line.
+    """
+    ct = sitk.GetArrayFromImage(sitk.ReadImage(ct_path)).astype(np.float32)
+    mk = sitk.GetArrayFromImage(sitk.ReadImage(mask_path)).astype(np.float32)
+    bg = ct[mk < 0.5]
+    if bg.size == 0:
+        print(f"  [check] {pid}: mask is full-coverage (no background voxels)")
+        return True
+    bg_min = float(bg.min())
+    bg_max = float(bg.max())
+    if bg_max <= -1.0 + tol:
+        print(f"  [check] {pid}: background CT min={bg_min:.4f}, max={bg_max:.4f} (≈ -1.0 ✓)")
+        return True
+    print(f"  [verify-warn] {pid}: background CT max={bg_max:.4f} > -1+{tol} (file kept; review)")
+    return False
 
 
 def main():
@@ -498,6 +565,7 @@ def main():
 
     manifest_rows = []
     errors = []
+    verify_warns = []  # patients whose post-save background check did not pass cleanly
 
     for row in tqdm(rows_meta, desc="preprocessing"):
         pid    = row["patient_id"]
@@ -508,36 +576,43 @@ def main():
 
         try:
             patient_paths = get_patient_paths(pdir)
-            original_geometry = read_geometry(patient_paths["ct"])
-            ct_pp, cbct_pp, mask_pp, cbct_global, pp_meta = preprocess(patient_paths, original_geometry)
+            arrays, original_geometry = load_patient_volumes(patient_paths)
+            ct_pp, cbct_pp, mask_pp, cbct_global, pp_meta = preprocess(arrays, original_geometry)
 
+            os.makedirs(pid_out, exist_ok=True)
             ct_path   = os.path.join(pid_out, "ct_preprocessed.mha")
             cbct_path = os.path.join(pid_out, "cbct_preprocessed.mha")
             mask_path = os.path.join(pid_out, "mask_preprocessed.mha")
             glob_path = os.path.join(pid_out, "cbct_global.mha")
             meta_path = os.path.join(pid_out, "preprocess_metadata.json")
 
-            save_vol(ct_pp,      ct_path,   pp_meta["output_geometry"])
-            save_vol(cbct_pp,    cbct_path, pp_meta["output_geometry"])
-            save_vol(mask_pp,    mask_path, pp_meta["output_geometry"])
+            save_vol(ct_pp,       ct_path,   pp_meta["output_geometry"])
+            save_vol(cbct_pp,     cbct_path, pp_meta["output_geometry"])
+            save_vol(mask_pp,     mask_path, pp_meta["output_geometry"])
             save_vol(cbct_global, glob_path, pp_meta["global_output_geometry"])
-            os.makedirs(pid_out, exist_ok=True)
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(pp_meta, f, indent=2)
 
             manifest_rows.append({
-                "patient_id":       pid,
-                "region":           region,
-                "split":            split,
-                "ct_path":          ct_path,
-                "cbct_path":        cbct_path,
-                "mask_path":        mask_path,
-                "cbct_global_path": glob_path,
+                "patient_id":           pid,
+                "region":               region,
+                "split":                split,
+                "ct_path":              ct_path,
+                "cbct_path":            cbct_path,
+                "mask_path":            mask_path,
+                "cbct_global_path":     glob_path,
                 "preprocess_meta_path": meta_path,
             })
         except Exception as e:
             print(f"\n  [error] {pid}: {e}")
             errors.append(pid)
+            continue
+
+        # Post-save QC: warn but never invalidate the manifest entry. Verify only the
+        # first successful patient per region — enough to catch regional regressions.
+        if region not in {r["region"] for r in manifest_rows[:-1]}:
+            if not _verify_air_background(ct_path, mask_path, pid):
+                verify_warns.append(pid)
 
     df = pd.DataFrame(manifest_rows)
     df.to_csv(manifest, index=False)
@@ -545,6 +620,8 @@ def main():
     print(f"\nDone. {len(df)} patients saved → {manifest}")
     if errors:
         print(f"  Errors ({len(errors)}): {errors}")
+    if verify_warns:
+        print(f"  Verify warns ({len(verify_warns)}): {verify_warns}")
     print("\nSplit summary:")
     print(df.groupby(["region", "split"]).size().unstack(fill_value=0).to_string())
 
