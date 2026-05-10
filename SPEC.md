@@ -389,7 +389,17 @@ Top-down 设计：以 D1-full 为基准，逐模块关闭，**其余配置完全
 E1 配置见 §5.6（cosine + L1 + Min-SNR + v_prediction + noise/t999/DDIM100）。
 **重启时机**：D1 在 v2 上跑通 ep30 之后再启动 E1，避免双线同时占卡且未对齐 baseline。
 
-### 6.5 Sampler sweep（best EMA 后）
+### 6.5 Joint → per-region fine-tune（提交策略）
+
+挑战 SynthRAD 的主线采用两阶段：
+
+1. **先训全局 joint model**：VAE-v2、D-v2、E-v2 都先用 AB/BB/HN/TH 全部训练集一起训练；D/E 保留 `region_emb`，得到公平的全局 baseline 和 per-region val 误差分布。
+2. **再按部位微调**：从全局 D/E best checkpoint 出发，分别 fine-tune `AB-only` / `BB-only` / `HN-only` / `TH-only` 模型；LR 用全局训练的 0.1×–0.3×，短程训练，按对应 region val MAE 早停。
+3. **提交候选**：推理时按 case region 路由到对应 fine-tuned 模型；同时保留全局 E 模型作为稳健 fallback。
+
+原则：VAE 只训一个全局版本，避免不同 region VAE 造成 latent 分布不一致；per-region fine-tune 只用于修正解剖区域特异性偏差，不作为 D/E 公平对比的起点。
+
+### 6.6 Sampler sweep（best EMA 后）
 
 ```
 init ∈ {cbct, noise} × t_start ∈ {200,300,500,700,999} × ddim_steps ∈ {50,100,200} × α ∈ {0.7, 1.0}
@@ -399,7 +409,7 @@ init ∈ {cbct, noise} × t_start ∈ {200,300,500,700,999} × ddim_steps ∈ {5
 - `t999/DDIM50` vs `t999/DDIM200` → 离散化误差大小
 - `t999/DDIM200` vs `t300/DDIM50` → CBCT-init 是否仍有优势
 
-### 6.6 决策树（D1 v2 baseline）
+### 6.7 决策树（D1 v2 baseline）
 
 | 检查点 | MAE 阈值 | 行动 |
 |---|---|---|
@@ -412,7 +422,7 @@ init ∈ {cbct, noise} × t_start ∈ {200,300,500,700,999} × ddim_steps ∈ {5
 | ep50 | < 80 HU | 继续到 ep100，目标落点 70–85 HU |
 | ep50 | ≥ 90 HU | 启动 B2/B3 |
 
-### 6.7 回退路径
+### 6.8 回退路径
 
 | 路径 | 触发 | 工作量 | 预期 MAE |
 |---|---|---|---|

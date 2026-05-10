@@ -20,8 +20,8 @@
 
 set -euo pipefail
 
-SAVE_DIR="checkpoints/vae_v2"
-RUN_NAME="vae-v2-bc64-ep200"
+SAVE_DIR="checkpoints/vae_v2_bf16"
+RUN_NAME="vae-v2-bf16-bc64-ep200"
 
 mkdir -p logs "${SAVE_DIR}"
 
@@ -36,6 +36,7 @@ screen -dmS vae_v2 bash -lc "
     --num-workers 4 \
     --epochs 200 \
     --lr 6.25e-6 \
+    --amp-dtype bf16 \
     --early-stopping 30 \
     --patience 10 \
     --l1-weight 1.0 \

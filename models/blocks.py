@@ -287,6 +287,9 @@ class PACALayer(nn.Module):
         )
 
         self.to_out = nn.Conv2d(query_dim, query_dim, kernel_size=1)
+        nn.init.zeros_(self.to_out.weight)
+        if self.to_out.bias is not None:
+            nn.init.zeros_(self.to_out.bias)
 
     def forward(self, q_features, kv_features):
         residual = q_features

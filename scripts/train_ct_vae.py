@@ -30,6 +30,14 @@ from utils.image_metrics import ImageMetrics
 REGION_NAMES = {v: k for k, v in REGION_TO_ID.items()}
 
 
+def _autocast_dtype(amp_dtype):
+    if amp_dtype == "bf16":
+        return torch.bfloat16
+    if amp_dtype == "fp16":
+        return torch.float16
+    raise ValueError("amp_dtype must be one of: fp16, bf16")
+
+
 class CTOnlyDataset(Dataset):
     """Expose CT images only from SliceDataset."""
 
@@ -82,7 +90,7 @@ def _image01(x: torch.Tensor):
     return ((x.detach().float().cpu().squeeze().clamp(-1, 1) + 1.0) / 2.0).numpy()
 
 
-def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, max_samples, prefix):
+def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, amp_dtype, max_samples, prefix):
     """Log fixed reconstructions for stable visual monitoring."""
     if not wandb_logger or fixed_batch is None:
         return
@@ -90,7 +98,7 @@ def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, m
     vae.eval()
     x = fixed_batch[:max_samples].to(device, non_blocking=True)
     with torch.no_grad():
-        with autocast(enabled=amp_enabled):
+        with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
             _, _, _, recon = vae(x)
 
     n = min(max_samples, x.shape[0])
@@ -113,7 +121,7 @@ def validate_vae(vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_
             if args.max_val_batches is not None and i >= args.max_val_batches:
                 break
             x = x.to(device, non_blocking=True)
-            with autocast(enabled=amp_enabled):
+            with autocast(enabled=amp_enabled, dtype=_autocast_dtype(args.amp_dtype)):
                 _, mu, logvar, recon = vae(x)
                 loss, parts = vae_loss_components(
                     recon,
@@ -237,6 +245,8 @@ def parse_args():
     p.add_argument("--vis-num-samples", type=int, default=4,
                    help="number of fixed train and validation samples to visualize")
     p.add_argument("--no-amp", action="store_true")
+    p.add_argument("--amp-dtype", choices=["fp16", "bf16"], default="fp16",
+                   help="CUDA autocast dtype when AMP is enabled. bf16 disables GradScaler.")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="cbct2sct_IBA")
     p.add_argument("--wandb-name", default=None)
@@ -300,7 +310,11 @@ def main():
         min_lr=1e-6,
     )
     amp_enabled = torch.cuda.is_available() and not args.no_amp
-    scaler = GradScaler(enabled=amp_enabled)
+    if amp_enabled and args.amp_dtype == "bf16" and torch.cuda.is_available():
+        bf16_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        if not bf16_supported:
+            raise RuntimeError("CUDA bf16 AMP requested but torch.cuda.is_bf16_supported() is false")
+    scaler = GradScaler(enabled=amp_enabled and args.amp_dtype == "fp16")
 
     wandb_logger = None
     if not args.no_wandb:
@@ -325,7 +339,7 @@ def main():
     print(f"Train slices : {len(train_ds)}")
     print(f"Val slices   : {len(val_ds)}")
     print(f"Batch size   : {args.batch_size}")
-    print(f"AMP enabled  : {amp_enabled}")
+    print(f"AMP enabled  : {amp_enabled} ({args.amp_dtype if amp_enabled else 'off'})")
     print(f"Save dir     : {args.save_dir}")
 
     if args.eval_only:
@@ -358,6 +372,7 @@ def main():
                 epoch=args.start_epoch,
                 wandb_logger=wandb_logger,
                 amp_enabled=amp_enabled,
+                amp_dtype=args.amp_dtype,
                 max_samples=args.vis_num_samples,
                 prefix="val",
             )
@@ -381,7 +396,7 @@ def main():
                     break
                 x = x.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=amp_enabled):
+                with autocast(enabled=amp_enabled, dtype=_autocast_dtype(args.amp_dtype)):
                     _, mu, logvar, recon = vae(x)
                     loss, parts = vae_loss_components(
                         recon,
@@ -416,7 +431,7 @@ def main():
                     if args.max_val_batches is not None and i >= args.max_val_batches:
                         break
                     x = x.to(device, non_blocking=True)
-                    with autocast(enabled=amp_enabled):
+                    with autocast(enabled=amp_enabled, dtype=_autocast_dtype(args.amp_dtype)):
                         _, mu, logvar, recon = vae(x)
                         loss, parts = vae_loss_components(
                             recon,
@@ -480,6 +495,7 @@ def main():
                     epoch=epoch_num,
                     wandb_logger=wandb_logger,
                     amp_enabled=amp_enabled,
+                    amp_dtype=args.amp_dtype,
                     max_samples=args.vis_num_samples,
                     prefix="train",
                 )
@@ -490,6 +506,7 @@ def main():
                     epoch=epoch_num,
                     wandb_logger=wandb_logger,
                     amp_enabled=amp_enabled,
+                    amp_dtype=args.amp_dtype,
                     max_samples=args.vis_num_samples,
                     prefix="val",
                 )

@@ -751,6 +751,7 @@ def train_unet_concat_control_paca(
     diffusion = Diffusion(device, timesteps=1000, noise_schedule=noise_schedule)
 
     best_val_loss = float('inf')
+    best_val_mae_hu = float('inf')
     early_stopping_counter = 0
     global_step = 0
 
@@ -835,8 +836,8 @@ def train_unet_concat_control_paca(
                 scale_before = scaler.get_scale()
                 if not torch.isfinite(grad_norm):
                     train_skipped_overflow += 1
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if scaler.is_enabled():
+                        scaler.update()
                     optimizer.zero_grad(set_to_none=True)
                     accum_batches = 0
                     print(
@@ -903,7 +904,10 @@ def train_unet_concat_control_paca(
                         control_feature, intermediate_preds = _control_inputs(
                             cbct_img, cbct_z, dr_module, control_adapter, use_controlnet, use_dr, control_source
                         )
-                        t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
+                        if timestep_sampling == "logit_normal":
+                            t = diffusion.sample_timesteps_logit_normal(z_ct.size(0), generator=val_generator)
+                        else:
+                            t = diffusion.sample_timesteps(z_ct.size(0), generator=val_generator)
                         noise = torch.randn(z_ct.shape, device=z_ct.device, dtype=z_ct.dtype, generator=val_generator)
                         z_noisy_ct = diffusion.add_noise(z_ct, t, noise=noise)
                         model_pred = _predict_noise(unet, controlnet, z_noisy_ct, cbct_z, t, control_feature, region_id,
@@ -975,6 +979,7 @@ def train_unet_concat_control_paca(
                 "amp/dtype_bf16": 1 if amp_enabled and amp_dtype == "bf16" else 0,
             }
             extra_metrics.update(latent_stats)
+            current_mae_hu = None
 
             if (epoch + 1) % max(eval_every, 1) == 0:
                 # max_val_batches doubles as max_val_patients here — the patient-level
@@ -987,6 +992,7 @@ def train_unet_concat_control_paca(
                     prediction_type=prediction_type, latent_scale=latent_scale,
                 )
                 extra_metrics.update(decoded_metrics)
+                current_mae_hu = decoded_metrics.get("val/mae_hu")
                 _log_fixed_val_images(
                     vae, unet, controlnet, dr_module, control_adapter, diffusion, fixed_val_batch, device,
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
@@ -1039,6 +1045,34 @@ def train_unet_concat_control_paca(
                     torch.save(paca_state_dict, os.path.join(save_dir, "paca_layers.pth"))
                 suffix = " using EMA" if ema is not None else ""
                 print(f"Saved best epoch {epoch+1}: val {avg_val_loss_total:.6f}{suffix}")
+
+            if current_mae_hu is not None and np.isfinite(current_mae_hu) and current_mae_hu < best_val_mae_hu:
+                best_val_mae_hu = float(current_mae_hu)
+                if ema is not None:
+                    torch.save(ema.backup["unet"], os.path.join(save_dir, "unet_full_best_mae.pth"))
+                    torch.save(unet.state_dict(), os.path.join(save_dir, "unet_ema_best_mae.pth"))
+                    torch.save(ema.state_dict(), os.path.join(save_dir, "unet_ema_state_best_mae.pth"))
+                    paca_state_source = unet.state_dict()
+                else:
+                    torch.save(unet.state_dict(), os.path.join(save_dir, "unet_full_best_mae.pth"))
+                    paca_state_source = unet.state_dict()
+                if controlnet is not None and use_controlnet:
+                    if ema is not None and "controlnet" in ema.backup:
+                        torch.save(ema.backup["controlnet"], os.path.join(save_dir, "controlnet_full_best_mae.pth"))
+                    torch.save(controlnet.state_dict(), os.path.join(save_dir, "controlnet_best_mae.pth"))
+                if dr_module is not None and use_dr:
+                    if ema is not None and "dr_module" in ema.backup:
+                        torch.save(ema.backup["dr_module"], os.path.join(save_dir, "dr_module_full_best_mae.pth"))
+                    torch.save(dr_module.state_dict(), os.path.join(save_dir, "dr_module_best_mae.pth"))
+                if control_adapter is not None and use_controlnet and control_source == "cbct_latent":
+                    if ema is not None and "control_adapter" in ema.backup:
+                        torch.save(ema.backup["control_adapter"], os.path.join(save_dir, "control_adapter_full_best_mae.pth"))
+                    torch.save(control_adapter.state_dict(), os.path.join(save_dir, "control_adapter_best_mae.pth"))
+                paca_state_dict = {k: v for k, v in paca_state_source.items() if 'paca' in k.lower()}
+                if paca_state_dict:
+                    torch.save(paca_state_dict, os.path.join(save_dir, "paca_layers_best_mae.pth"))
+                suffix = " using EMA" if ema is not None else ""
+                print(f"Saved best MAE epoch {epoch+1}: val/mae_hu {best_val_mae_hu:.2f}{suffix}")
         finally:
             if ema is not None:
                 ema.restore()
