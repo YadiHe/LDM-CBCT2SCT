@@ -29,8 +29,6 @@ class PerceptualLoss(torch.nn.Module):
         self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # adjust if needed
 
     def forward(self, recon_x, x):
-        recon_x = ((recon_x + 1.0) * 0.5).clamp(0.0, 1.0)
-        x = ((x + 1.0) * 0.5).clamp(0.0, 1.0)
         recon_x = recon_x.repeat(1, 3, 1, 1)  # grayscale -> 3-channel
         x = x.repeat(1, 3, 1, 1)
 

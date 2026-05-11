@@ -30,14 +30,6 @@ from utils.image_metrics import ImageMetrics
 REGION_NAMES = {v: k for k, v in REGION_TO_ID.items()}
 
 
-def _autocast_dtype(amp_dtype):
-    if amp_dtype == "bf16":
-        return torch.bfloat16
-    if amp_dtype == "fp16":
-        return torch.float16
-    raise ValueError("amp_dtype must be one of: fp16, bf16")
-
-
 class CTOnlyDataset(Dataset):
     """Expose CT images only from SliceDataset."""
 
@@ -65,6 +57,11 @@ def vae_loss_components(
     kl_weight=1e-5,
     l1_weight=1.0,
 ):
+    # fp16 autocast 下 logvar.exp() 仍走 fp16，loss 一律提到 fp32 算。
+    recon = recon.float()
+    x = x.float()
+    mu = mu.float()
+    logvar = logvar.float()
     mse = F.mse_loss(recon, x)
     l1 = F.l1_loss(recon, x)
     kl = torch.mean(-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3]))
@@ -90,7 +87,7 @@ def _image01(x: torch.Tensor):
     return ((x.detach().float().cpu().squeeze().clamp(-1, 1) + 1.0) / 2.0).numpy()
 
 
-def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, amp_dtype, max_samples, prefix):
+def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, max_samples, prefix):
     """Log fixed reconstructions for stable visual monitoring."""
     if not wandb_logger or fixed_batch is None:
         return
@@ -98,7 +95,7 @@ def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, a
     vae.eval()
     x = fixed_batch[:max_samples].to(device, non_blocking=True)
     with torch.no_grad():
-        with autocast(enabled=amp_enabled, dtype=_autocast_dtype(amp_dtype)):
+        with autocast(enabled=amp_enabled):
             _, _, _, recon = vae(x)
 
     n = min(max_samples, x.shape[0])
@@ -111,39 +108,53 @@ def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, a
         wandb_logger.log_image(f"{prefix}_visual/error_{i}", error, caption=f"epoch {epoch} {prefix} absolute error", step=epoch)
 
 
-def validate_vae(vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_enabled):
-    vae.eval()
-    val_total = 0.0
-    val_parts = {}
-    val_batches = 0
-    with torch.no_grad():
-        for i, x in enumerate(val_loader):
-            if args.max_val_batches is not None and i >= args.max_val_batches:
+def run_epoch(
+    vae, loader, device, perceptual_loss, ssim_loss, args, amp_enabled,
+    *, optimizer=None, scaler=None, max_batches=None,
+):
+    """One pass over loader. Train when optimizer is given, else val."""
+    is_train = optimizer is not None
+    vae.train() if is_train else vae.eval()
+    total = 0.0
+    parts_sum = {}
+    n_batches = 0
+    grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
+    with grad_ctx:
+        for i, x in enumerate(loader):
+            if max_batches is not None and i >= max_batches:
                 break
             x = x.to(device, non_blocking=True)
-            with autocast(enabled=amp_enabled, dtype=_autocast_dtype(args.amp_dtype)):
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=amp_enabled):
                 _, mu, logvar, recon = vae(x)
                 loss, parts = vae_loss_components(
-                    recon,
-                    x,
-                    mu,
-                    logvar,
-                    perceptual_loss,
-                    ssim_loss,
-                    args.perceptual_weight,
-                    args.ssim_weight,
-                    args.mse_weight,
-                    args.kl_weight,
-                    args.l1_weight,
+                    recon, x, mu, logvar, perceptual_loss, ssim_loss,
+                    args.perceptual_weight, args.ssim_weight, args.mse_weight,
+                    args.kl_weight, args.l1_weight,
                 )
-            val_total += loss.item()
+            if is_train:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            total += loss.item()
             for k, v in parts.items():
-                val_parts[k] = val_parts.get(k, 0.0) + v
-            val_batches += 1
+                parts_sum[k] = parts_sum.get(k, 0.0) + v
+            n_batches += 1
 
-    avg_val = val_total / max(val_batches, 1)
-    val_metrics = {f"val/{k.split('/')[-1]}": v / max(val_batches, 1) for k, v in val_parts.items()}
-    return avg_val, val_metrics, val_batches
+    prefix = "train" if is_train else "val"
+    avg = total / max(n_batches, 1)
+    metrics = {f"{prefix}/{k.split('/')[-1]}": v / max(n_batches, 1) for k, v in parts_sum.items()}
+    return avg, metrics, n_batches
+
+
+def validate_vae(vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_enabled):
+    return run_epoch(
+        vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_enabled,
+        max_batches=args.max_val_batches,
+    )
 
 
 @torch.no_grad()
@@ -245,8 +256,6 @@ def parse_args():
     p.add_argument("--vis-num-samples", type=int, default=4,
                    help="number of fixed train and validation samples to visualize")
     p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--amp-dtype", choices=["fp16", "bf16"], default="fp16",
-                   help="CUDA autocast dtype when AMP is enabled. bf16 disables GradScaler.")
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="cbct2sct_IBA")
     p.add_argument("--wandb-name", default=None)
@@ -310,11 +319,7 @@ def main():
         min_lr=1e-6,
     )
     amp_enabled = torch.cuda.is_available() and not args.no_amp
-    if amp_enabled and args.amp_dtype == "bf16" and torch.cuda.is_available():
-        bf16_supported = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-        if not bf16_supported:
-            raise RuntimeError("CUDA bf16 AMP requested but torch.cuda.is_bf16_supported() is false")
-    scaler = GradScaler(enabled=amp_enabled and args.amp_dtype == "fp16")
+    scaler = GradScaler(enabled=amp_enabled)
 
     wandb_logger = None
     if not args.no_wandb:
@@ -339,7 +344,7 @@ def main():
     print(f"Train slices : {len(train_ds)}")
     print(f"Val slices   : {len(val_ds)}")
     print(f"Batch size   : {args.batch_size}")
-    print(f"AMP enabled  : {amp_enabled} ({args.amp_dtype if amp_enabled else 'off'})")
+    print(f"AMP enabled  : {amp_enabled} ({'fp16' if amp_enabled else 'off'})")
     print(f"Save dir     : {args.save_dir}")
 
     if args.eval_only:
@@ -372,7 +377,6 @@ def main():
                 epoch=args.start_epoch,
                 wandb_logger=wandb_logger,
                 amp_enabled=amp_enabled,
-                amp_dtype=args.amp_dtype,
                 max_samples=args.vis_num_samples,
                 prefix="val",
             )
@@ -387,77 +391,16 @@ def main():
     try:
         for epoch in range(args.start_epoch, args.epochs):
             epoch_num = epoch + 1
-            vae.train()
-            train_total = 0.0
-            train_parts = {}
-            train_batches = 0
-            for i, x in enumerate(train_loader):
-                if args.max_train_batches is not None and i >= args.max_train_batches:
-                    break
-                x = x.to(device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=amp_enabled, dtype=_autocast_dtype(args.amp_dtype)):
-                    _, mu, logvar, recon = vae(x)
-                    loss, parts = vae_loss_components(
-                        recon,
-                        x,
-                        mu,
-                        logvar,
-                        perceptual_loss,
-                        ssim_loss,
-                        args.perceptual_weight,
-                        args.ssim_weight,
-                        args.mse_weight,
-                        args.kl_weight,
-                        args.l1_weight,
-                    )
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(vae.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-
-                train_total += loss.item()
-                for k, v in parts.items():
-                    train_parts[k] = train_parts.get(k, 0.0) + v
-                train_batches += 1
-
-            vae.eval()
-            val_total = 0.0
-            val_parts = {}
-            val_batches = 0
-            with torch.no_grad():
-                for i, x in enumerate(val_loader):
-                    if args.max_val_batches is not None and i >= args.max_val_batches:
-                        break
-                    x = x.to(device, non_blocking=True)
-                    with autocast(enabled=amp_enabled, dtype=_autocast_dtype(args.amp_dtype)):
-                        _, mu, logvar, recon = vae(x)
-                        loss, parts = vae_loss_components(
-                            recon,
-                            x,
-                            mu,
-                            logvar,
-                            perceptual_loss,
-                            ssim_loss,
-                            args.perceptual_weight,
-                            args.ssim_weight,
-                            args.mse_weight,
-                            args.kl_weight,
-                            args.l1_weight,
-                        )
-                    val_total += loss.item()
-                    for k, v in parts.items():
-                        val_parts[k] = val_parts.get(k, 0.0) + v
-                    val_batches += 1
-
-            avg_train = train_total / max(train_batches, 1)
-            avg_val = val_total / max(val_batches, 1)
+            avg_train, train_metrics, train_batches = run_epoch(
+                vae, train_loader, device, perceptual_loss, ssim_loss, args, amp_enabled,
+                optimizer=optimizer, scaler=scaler, max_batches=args.max_train_batches,
+            )
+            avg_val, val_metrics, val_batches = validate_vae(
+                vae, val_loader, device, perceptual_loss, ssim_loss, args, amp_enabled,
+            )
             scheduler.step(avg_val)
             lr = optimizer.param_groups[0]["lr"]
 
-            train_metrics = {f"train/{k.split('/')[-1]}": v / max(train_batches, 1) for k, v in train_parts.items()}
-            val_metrics = {f"val/{k.split('/')[-1]}": v / max(val_batches, 1) for k, v in val_parts.items()}
             print(
                 f"Epoch {epoch_num}/{args.epochs} | "
                 f"Train {avg_train:.6f} | Val {avg_val:.6f} | LR {lr:.2e}"
@@ -495,8 +438,7 @@ def main():
                     epoch=epoch_num,
                     wandb_logger=wandb_logger,
                     amp_enabled=amp_enabled,
-                    amp_dtype=args.amp_dtype,
-                    max_samples=args.vis_num_samples,
+                        max_samples=args.vis_num_samples,
                     prefix="train",
                 )
                 log_vae_images(
@@ -506,8 +448,7 @@ def main():
                     epoch=epoch_num,
                     wandb_logger=wandb_logger,
                     amp_enabled=amp_enabled,
-                    amp_dtype=args.amp_dtype,
-                    max_samples=args.vis_num_samples,
+                        max_samples=args.vis_num_samples,
                     prefix="val",
                 )
                 # Patient-level SynthRAD-aligned metrics for tracking the HU-space floor.
