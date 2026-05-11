@@ -87,8 +87,18 @@ def _image01(x: torch.Tensor):
     return ((x.detach().float().cpu().squeeze().clamp(-1, 1) + 1.0) / 2.0).numpy()
 
 
+def _hstack_panels(*panels: np.ndarray, separator_px: int = 4) -> np.ndarray:
+    """Horizontally concat equal-height grayscale panels with white separator bars."""
+    H = panels[0].shape[0]
+    sep = np.ones((H, separator_px), dtype=np.float32)
+    out = [panels[0]]
+    for p in panels[1:]:
+        out.extend([sep, p])
+    return np.concatenate(out, axis=1)
+
+
 def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, max_samples, prefix):
-    """Log fixed reconstructions for stable visual monitoring."""
+    """Log fixed reconstructions as a 3-panel strip per sample: original | recon | error."""
     if not wandb_logger or fixed_batch is None:
         return
 
@@ -100,12 +110,18 @@ def log_vae_images(vae, fixed_batch, device, epoch, wandb_logger, amp_enabled, m
 
     n = min(max_samples, x.shape[0])
     for i in range(n):
-        original = _image01(x[i])
+        original      = _image01(x[i])
         reconstructed = _image01(recon[i])
+        # Error: |recon - x| in [-1, 1] space, normalized to [0, 1] for display.
+        # Same scale across runs (no per-image min-max), so colors are comparable.
         error = torch.abs(recon[i].detach().float() - x[i].detach().float()).cpu().squeeze().clamp(0, 2).numpy() / 2.0
-        wandb_logger.log_image(f"{prefix}_visual/original_{i}", original, caption=f"epoch {epoch} {prefix} original", step=epoch)
-        wandb_logger.log_image(f"{prefix}_visual/reconstructed_{i}", reconstructed, caption=f"epoch {epoch} {prefix} reconstructed", step=epoch)
-        wandb_logger.log_image(f"{prefix}_visual/error_{i}", error, caption=f"epoch {epoch} {prefix} absolute error", step=epoch)
+        panel = _hstack_panels(original, reconstructed, error)
+        wandb_logger.log_image(
+            f"{prefix}_visual/sample_{i}",
+            panel,
+            caption=f"epoch {epoch} {prefix} | original ▏ recon ▏ error",
+            step=epoch,
+        )
 
 
 def run_epoch(
@@ -466,6 +482,12 @@ def main():
                     f"ms_ssim_vae={hu_metrics['val/ms_ssim_vae']:.4f}  "
                     f"(n={int(hu_metrics['val/n_patients'])})"
                 )
+                # Snapshot at every vis_every epoch so we can pick the best HU ckpt
+                # post-hoc (val_loss-best may drift from mae_hu-best after L1 is
+                # dominated by SSIM/Perceptual in late training).
+                snap_path = os.path.join(args.save_dir, f"vae_ep{epoch_num:04d}.pth")
+                torch.save(vae.state_dict(), snap_path)
+                print(f"  [snapshot] saved {snap_path}")
 
             if args.early_stopping and bad_epochs >= args.early_stopping:
                 print(f"Early stopped after {args.early_stopping} epochs without improvement.")

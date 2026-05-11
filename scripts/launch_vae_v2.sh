@@ -17,16 +17,28 @@
 #         ms_ssim_vae   : 5-scale 3D MS-SSIM，masked 版本（每 scale 的 SSIM map 在 mask 内取均值再连乘）
 #       三个指标均与 D1 训练 val 同标尺、与 SynthRAD 官方排行榜对齐。
 # 参考：v1 VAE 在 v1 数据上 ≈ 25 HU；v2 训练目标：受 CLIP 缩放影响后 ≤ 30 HU。
+#
+# Loss 权重决策历史：
+#   v1 默认  (ssim=0.8, perc=0.1)：ep20 mae_hu_vae=25.45（接近 v1 floor），
+#                                    但 ep30→ep50 退化到 32→36→42 HU。
+#   v2 尝试1 (ssim=0.4, perc=0.03)：试图通过降低 SSIM/Perceptual 抑制后期退化，
+#                                    结果反而 ep10=76, ep20=50, ep30=68 全程更差。
+#   原因：SSIM/Perceptual 是 anti-smoothing prior（罚局部方差丢失/高频丢失），
+#         降权重让 L1 走 trivial smoothing 解（输出局部均值），抹平骨细节 →
+#         L1 持续下降但 mae_hu 反而上升。
+#   结论：回到 ssim=0.8, perc=0.1，搭配每 10 epoch snapshot 锁定 ep20 最优。
+#         ep20 (~25 HU) 已接近 latent (3×64×64) 信息瓶颈，后期退化用 snapshot 兜底。
 
 set -euo pipefail
 
-SAVE_DIR="checkpoints/vae_v2_fp16"
-RUN_NAME="vae-v2-fp16-bc64-ep200"
+SAVE_DIR="checkpoints/vae_v2_fp16_snap"
+RUN_NAME="vae-v2-fp16-snap-bc64-ep200"
 
 mkdir -p logs "${SAVE_DIR}"
 
 screen -dmS vae_v2 bash -lc "
   HTTP_PROXY=http://127.0.0.1:7892 HTTPS_PROXY=http://127.0.0.1:7892 \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   python -u scripts/train_ct_vae.py \
     --manifest data/manifest.csv \
     --save-dir ${SAVE_DIR} \

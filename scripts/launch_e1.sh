@@ -12,6 +12,7 @@ SAVE_DIR="checkpoints/phase1_matrix/E1-cosine-fullpaca-bc256-bs24-ep100-s42"
 
 screen -dmS e1_cosine_full bash -lc "
   HTTP_PROXY=http://127.0.0.1:7892 HTTPS_PROXY=http://127.0.0.1:7892 \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   python -u scripts/train_concat_paca.py \
     --manifest data/manifest.csv \
     --vae-path checkpoints/vae/vae_best.pth \

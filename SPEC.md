@@ -12,8 +12,9 @@
 - **当前进度**：
   1. ✅ P0 预处理 v2 已生成（218 train + 23 val）
   2. ✅ P1 旧 VAE 在 v2 上退化到 58 HU（> 10 HU 阈值），触发 P2
-  3. 🟢 **P2 进行中**：VAE v2 重训运行中（`scripts/launch_vae_v2.sh`，run `vae-v2-fp16-bc64-ep200`）
-  4. ⏳ P3 D1 baseline 等 P2 ep30 决策点
+  3. ✅ **P2 完成（换路线）**：自训 VAE 实际 floor 25-42 HU（loss/metric 解耦造成中后期退化）；改为接入 stanfordmimi/MedVAE 4_3_2d 预训练权重，**zero-shot mae_hu_vae = 16.15 HU**（X-ray 训→CT zero-shot 直接超过任何自训版本）。详见 §6.11。
+  4. ⏳ **P3 D1 baseline 待启动**：直接用 `--vae-path medvae` 起 D1 v2。
+- **VAE 路线 finalized**：项目内自包含 MedVAE，无 HF 网络依赖（`third_party/medvae/` 库源 + `checkpoints/medvae/` 权重）。`models.vae.load_vae("medvae")` 直接 drop-in。
 - **AMP 决策（VAE 已锁）**：fp16。bf16 实测在 VAE 重建任务上 300 步 mae_hu 159 vs fp16 的 31（7-bit 尾数对前向 conv 累加精度不够），即使 loss 全部 fp32 reduce 也救不回。详见 §6.9。D/E 的 AMP 选择待实测对照，当前默认 bf16。
 - **EMA 实现升级**：`ModelEMA` 加 `num_updates` 自适应 warmup（`min(decay, (1+n)/(10+n))`），根治 cold-start 阶段 `raw > EMA` 现象。D1 训练支持 `--eval-raw-compare` 系统记录 `val/ema_gain_mae_hu`。详见 §6.10。
 - **已跑实验仅作历史参考**（基于预处理 v1：CLIP_MAX=1500、mask 外保留原 HU）。详见 §5。
@@ -181,13 +182,14 @@ VAE 仅用 CT 训练，inference 时也用同一 VAE encode 整个 CBCT 作为 l
 
 | 组件 | base=64 | base=128 | base=256 | 说明 |
 |---|---:|---:|---:|---|
-| VAE | 9.5M（冻结） | 9.5M | 9.5M | (B,1,256,256)↔(B,3,64,64) |
+| **VAE (MedVAE 4_3_2d, frozen)** | **55.9M** | 55.9M | 55.9M | **stanfordmimi/MedVAE**, (B,1,256,256)↔(B,3,64,64), z-scored 输出 |
 | DR | 0.10M | 0.16M | 0.27M | 像素空间 CBCT→CT 降质映射 + 多尺度辅助 |
 | ControlNet | 11.3M | 45.0M | 179.9M | 复制 UNet encoder + ZeroConv |
 | UNet (主) | 19.9M | 79.4M | 317.2M | 含 PACA 上采样路径 |
-| **可训练合计** | **~31M** | **~125M** | **~497M** | |
+| **可训练合计** | **~31M** | **~125M** | **~497M** | VAE 冻结，不计入 |
 
 > **注意**：`fusion=add` 下 PACA 参数（约 24M @ bc256）不参与 forward，活跃参数 ~497M；`fusion=paca/both` 才激活。
+> VAE 参数从 v1/v2 的 9.5M 增至 55.9M，但**冻结 + 无梯度**，对训练显存影响仅在 inference forward activation。
 
 ### 3.3 关键设计
 
@@ -195,7 +197,7 @@ VAE 仅用 CT 训练，inference 时也用同一 VAE encode 整个 CBCT 作为 l
 - **PACA**（Pixel-wise Attention for ControlNet-Assisted）：上采样路径对 ControlNet 残差做像素级注意力
 - **Mask-weighted latent loss**：`F.avg_pool2d(mask, kernel_size=4)` 把 256×256 mask 压到 64×64，作为 diffusion loss 权重
 - **DR 辅助 loss**：`L = MSE(noise) + γ × [L1(pred_128, gt_128) + L1(pred_64, gt_64)]`
-- **Latent 模式**：`mu`（不 reparameterize），latent_scale=1.3995
+- **Latent 模式**：`mu`（不 reparameterize）。MedVAE 后 `latent_scale=1.0`（adapter 已 per-channel z-score 让 latent ~N(0,1)；旧自训 VAE 用 1.3995 不再适用）
 
 ---
 
@@ -351,13 +353,13 @@ WandB `8ypydmdw`，从 D1-bf16-drop01 ckpt 切 L1+Min-SNR+cosine+t999/noise：
 |---|---|---|---|
 | **P0** | ✅ done | 跑预处理 v2，覆盖 `data/preprocessed/` 并刷新 `data/manifest.csv` | 218+23 例 v2 数据 |
 | **P1** | ✅ done | 在 v2 数据上 eval 旧 VAE，看 mae_hu_vae 是否仍 ≈ 25 HU；实测 58 HU，退化 33 HU | 触发 P2 |
-| **P2** | 🟢 running | 用 v2 train=218 重训 VAE，fp16 AMP，legacy PerceptualLoss | `checkpoints/vae_v2_fp16/vae_best.pth` |
-| **P3** | ⏳ blocked | 在 v2 数据 + 新 VAE 上重做 D1 baseline 50 ep（screening 等价） | v2 baseline MAE |
+| **P2** | ✅ done（**换路线**）| 自训路径试到 ep20=25 HU 后退化到 42 HU；改接 stanfordmimi/MedVAE 4_3_2d，zero-shot 16.15 HU | `checkpoints/medvae/vae_4x_3c_2D.ckpt` + `third_party/medvae/` |
+| **P3** | ⏳ ready to start | 在 v2 数据 + MedVAE（`--vae-path medvae`）上跑 D1 baseline 50 ep | v2 baseline MAE |
 
-**P2 决策点**（来自 `launch_vae_v2.sh`）：
-- ep10 mae_hu_vae < 35 HU → 正常，继续
-- ep30 < 28 HU → 路径 A：长训到 ep200
-- ep30 > 40 HU → 架构 review（kl_weight / latent_channels）
+**P2 历史**（不再追求自训 VAE）：自训路径中两次尝试均未超过 MedVAE zero-shot：
+- 第一版 (ssim=0.8, perc=0.1)：ep20 mae=25.45 → ep30 退化到 32, ep50 退化到 42（loss/metric 解耦：SSIM/Perceptual 在 L1 低位时反向推动）
+- 第二版 (ssim=0.4, perc=0.03)：试图通过降权重抑制退化，实测 ep10=76, ep20=50, ep30=68 全程更差（SSIM/Perceptual 是 anti-smoothing prior，降权重让 L1 走 trivial smoothing 解抹平骨细节）
+- 结论：218 例小数据集训不出比 MedVAE（百万+ X-ray 训）更好的 VAE；自训路径放弃。详见 §6.11。
 
 ### 6.2 D1 主线（v2 上重新校准）
 
@@ -368,6 +370,8 @@ D1 = `UNet bc256 + ControlNet(cbct_latent) + region_emb`，`fusion=add`，活跃
 | 项 | 值 |
 |---|---|
 | `base_channels` | 256 |
+| **VAE** | **`--vae-path medvae`**（MedVAE 4_3_2d，frozen，zero-shot floor 16.15 HU）|
+| **latent_scale** | **1.0**（MedVAE adapter 已 per-channel z-score；v1 用的 1.3995 不再适用） |
 | EMA | 0.9995 上限 + num_updates warmup（§6.10）；建议带 `--eval-raw-compare` 验证 EMA 收益 |
 | AMP | bf16（待 fp16 实测对照；VAE 已锁 fp16 不可外推到 diffusion） |
 | Optimizer | AdamW wd=1e-4 |
@@ -470,20 +474,81 @@ bf16 不是数值溢出（loss 已全部 cast 到 fp32 算），是 7-bit 尾数
 
 下游决策规则：连续 2 次 `val/ema_gain_mae_hu < 0` → 把 `ema_decay` 上限往下调一档（0.9995 → 0.999），不要直接跳到 0.995（半衰期 138 步 ≈ 关 EMA）。
 
+### 6.11 MedVAE 集成（替代自训 VAE）
+
+**决策**：放弃自训 VAE，直接用 stanfordmimi/MedVAE 4_3_2d 预训练权重。
+
+**为什么换路线**：
+
+自训 VAE 在 v2 数据上的实测 trajectory（200 ep，fp16，bc=64，latent_ch=3）：
+
+| 配置 | ep10 mae | ep20 | ep30 | ep50 | best (val_loss) |
+|---|---:|---:|---:|---:|---:|
+| ssim=0.8, perc=0.1 | 30.58 | **25.45** ✓ | 32.56 | 42.44 | 42.60（ep~54）|
+| ssim=0.4, perc=0.03 | 76.77 | 50.63 | 68.76 | — | — |
+
+ep20 = 25 HU 接近 latent (3, 64, 64) 信息瓶颈。中后期退化原因是 **L1 trivial-smoothing 解 vs SSIM/Perceptual anti-smoothing prior** 的拉扯（详细诊断见 commits 4c8ddxx）。218 例小数据集训不出比 MedVAE 更稳定的 VAE。
+
+**MedVAE 实测**（zero-shot，无 fine-tune，v2 val 23 例）：
+
+| 指标 | 数字 | 对比 |
+|---|---:|---|
+| **mae_hu_vae** | **16.15 HU** | 比自训历史最优低 9 HU，比当前 best 低 26 HU |
+| psnr_vae | 44.25 dB | vs 自训 39.36（best） |
+| ms_ssim_vae | 0.9992 | vs 自训 0.9957 |
+
+Per-region: BB 18.49 / AB 14.39 / HN 16.18 / TH 15.26（**BB 高 HU 段反而是 MedVAE 优势最大区域** —— 大数据预训练对密集骨/牙泛化好）。
+
+**LDM 理论上限重估**：
+
+```
+v2 自训 VAE floor ≈ 25 HU → LDM 实际上限 38-50 HU
+MedVAE floor      ≈ 16 HU → LDM 实际上限 24-32 HU    ← 现在
+```
+
+**集成方式**：完全 self-contained，无 HF 网络依赖。
+
+| 路径 | 大小 | 用途 | git 状态 |
+|---|---:|---|---|
+| `third_party/medvae/` | 428 KB | MedVAE 库源（vendored from StanfordMIMI/MedVAE）| 可 commit |
+| `checkpoints/medvae/vae_4x_3c_2D.ckpt` | 214 MB | 权重 | `.gitignore` 排除（手动 scp）|
+| `checkpoints/medvae/medvae_4x3.yaml` | 1.1 KB | 模型 config | `.gitignore` 排除 |
+| `models/vae_medvae.py` | — | adapter（drop-in 替换 `models.vae.VAE`）| 可 commit |
+
+**Adapter 行为**（`MedVAEAdapter`）：
+
+1. 输入 1ch → broadcast 3ch（MedVAE 原本是 SD-style 3ch IO）
+2. 输出 3ch → mean 1ch（grayscale 重建）
+3. **Per-channel z-score**：v2 train 实测 latent 统计 μ=[10.87, -9.26, -0.81]，σ=[6.58, 5.00, 1.43]；adapter 输出已归一化到 ~N(0,1)，所以 D1 用 `--latent-scale 1.0`
+4. 全部 frozen，55.9M 参数不进梯度图（对训练显存影响仅 inference forward）
+
+**接入命令**（D1 训练）：
+```bash
+python scripts/train_concat_paca.py --vae-path medvae [...其余参数同 v2 baseline]
+```
+
+`load_vae("medvae")` 路径在 `models/vae.py` dispatch 到 `MedVAEAdapter`，从 `checkpoints/medvae/` 读权重。**完全离线**，`HF_HUB_OFFLINE=1` 已设在 launch sh 作为 safety net 但实际不再调 HF lib。
+
 ---
 
 ## 7. 产物清单与命名
 
 ```
-checkpoints/phase1_matrix/{run_name}/
-  ├── unet_full.pth          # raw UNet（续训用）
-  ├── unet_ema.pth           # EMA（推理用）
-  ├── unet_ema_state.pth     # EMA state（shadow + decay + num_updates，续训 EMA 用；旧 ckpt 无 num_updates 默认 0 重新 warmup）
-  ├── controlnet_full.pth    # raw ControlNet（续训用）
-  ├── controlnet.pth         # EMA ControlNet（推理用）
-  ├── control_adapter_full.pth / control_adapter.pth
-  ├── paca_layers.pth
-  └── predictions/           # fixed val 输出
+checkpoints/
+  ├── medvae/                            # MedVAE 预训练权重（VAE 已 finalize，§6.11）
+  │   ├── vae_4x_3c_2D.ckpt              #   214 MB，.gitignore，新机器手动 scp
+  │   └── medvae_4x3.yaml                #   1.1 KB
+  └── phase1_matrix/{run_name}/          # D1/E1 训练产物
+      ├── unet_full.pth                  #   raw UNet（续训用）
+      ├── unet_ema.pth                   #   EMA（推理用）
+      ├── unet_ema_state.pth             #   EMA state（shadow + decay + num_updates，续训 EMA 用；旧 ckpt 无 num_updates 默认 0 重新 warmup）
+      ├── controlnet_full.pth            #   raw ControlNet（续训用）
+      ├── controlnet.pth                 #   EMA ControlNet（推理用）
+      ├── control_adapter_full.pth / control_adapter.pth
+      ├── paca_layers.pth
+      └── predictions/                   #   fixed val 输出
+
+third_party/medvae/                      # MedVAE 库源（vendored，可 commit）
 ```
 
 - WandB project：`cbct2sct_IBA`，group：`phase1-matrix-2026-05`
@@ -498,7 +563,7 @@ checkpoints/phase1_matrix/{run_name}/
 ## 8. 已知局限
 
 1. **预处理 v1 → v2 不向后兼容**：所有 v1 时期的 D1/VAE checkpoint 都不能直接续训 v2 数据；§5 所有结果仅作历史参考。
-2. **VAE train split**：旧 VAE 基于 train=199；当前 split 是 218。Phase 1 内是否重训 VAE 待 P1 验证决定。
+2. **VAE 已 finalize 为 MedVAE**：不再自训。新机器跑前确保 `checkpoints/medvae/vae_4x_3c_2D.ckpt` 已 scp 过去（214 MB，`.gitignore` 排除）。
 3. **PACA 死权重**：`fusion=add` 下 PACA 参数不参与 forward，仅占存储和 optimizer 状态。报数时使用活跃参数 ~497M。
 4. **续训目标切换高风险**：v1 上已验证从 MSE ckpt 切 L1+Min-SNR+t999/noise 会崩；v2 重启后 D1/E1 严格分线，不混合协议续训。
 5. **单 seed**：seed=42 单次。最终结论前补 seed=43 至少复现 D1 + 1 个消融。

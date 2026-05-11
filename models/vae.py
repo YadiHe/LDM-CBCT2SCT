@@ -44,7 +44,28 @@ def vae_loss(recon, x, mu, logvar, perceptual_loss, ssim_loss, perceptual_weight
     return total_loss
     
 def load_vae(save_path=None, trainable=False):
+    """Load a VAE.
+
+    `save_path` accepts:
+      • Local checkpoint path (e.g. "checkpoints/vae_v2/vae_best.pth")
+      • "medvae[:model_name]" for stanfordmimi/MedVAE pretrained
+            e.g. "medvae" or "medvae:medvae_4_3_2d"
+            Downloads weights via HuggingFace Hub on first use.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # MedVAE adapter path
+    if isinstance(save_path, str) and save_path.startswith("medvae"):
+        from models.vae_medvae import MedVAEAdapter
+        parts = save_path.split(":", 1)
+        model_name = parts[1] if len(parts) > 1 and parts[1] else MedVAEAdapter.DEFAULT_MODEL_NAME
+        adapter = MedVAEAdapter(model_name=model_name).to(device)
+        if trainable:
+            print("MedVAEAdapter is always frozen; ignoring trainable=True")
+        adapter.eval()
+        print(f"MedVAE loaded ({model_name}, frozen)")
+        return adapter
+
     vae = VAE().to(device)
     if save_path is None:
         print("VAE initialized with random weights.")
