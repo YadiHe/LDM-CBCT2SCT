@@ -38,10 +38,17 @@ class LatentControlAdapter(nn.Module):
 
 
 class ModelEMA:
-    """Track EMA weights for one or more modules."""
+    """Track EMA weights for one or more modules.
+
+    Uses the torch_ema-style `num_updates` warmup so the shadow doesn't drag
+    initial random weights deep into training. Effective decay each step is
+        min(decay, (1 + n) / (10 + n))
+    which approaches `decay` after a few thousand steps but stays small early on.
+    """
 
     def __init__(self, modules, decay=0.999):
         self.decay = float(decay)
+        self.num_updates = 0
         if isinstance(modules, nn.Module):
             modules = {"module": modules}
         self.modules = dict(modules)
@@ -55,13 +62,18 @@ class ModelEMA:
             for key, value in module.state_dict().items()
         }
 
+    def _effective_decay(self):
+        return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+
     def update(self):
+        self.num_updates += 1
+        d = self._effective_decay()
         for name, module in self.modules.items():
             state = module.state_dict()
             for key, value in state.items():
                 value = value.detach()
                 if torch.is_floating_point(value):
-                    self.shadow[name][key].mul_(self.decay).add_(value, alpha=1.0 - self.decay)
+                    self.shadow[name][key].mul_(d).add_(value, alpha=1.0 - d)
                 else:
                     self.shadow[name][key] = value.clone()
 
@@ -82,11 +94,13 @@ class ModelEMA:
     def state_dict(self):
         return {
             "decay": self.decay,
+            "num_updates": self.num_updates,
             "shadow": self.shadow,
         }
 
     def load_state_dict(self, state_dict):
         self.decay = float(state_dict.get("decay", self.decay))
+        self.num_updates = int(state_dict.get("num_updates", 0))
         shadow = state_dict["shadow"]
         first_value = next(iter(shadow.values())) if shadow else {}
         if isinstance(first_value, torch.Tensor):
@@ -639,6 +653,7 @@ def train_unet_concat_control_paca(
     ema_path=None,
     latent_stats_batches=4,
     eval_every=10,
+    eval_raw_compare=False,
     fixed_val_batch=None,
     fixed_val_max_images=48,
     loss_type="l1",
@@ -984,6 +999,8 @@ def train_unet_concat_control_paca(
             if (epoch + 1) % max(eval_every, 1) == 0:
                 # max_val_batches doubles as max_val_patients here — the patient-level
                 # eval iterates patients, not batches. None = full val set (~23 patients).
+                # Note: at this point `unet` already holds EMA weights (if EMA is on),
+                # because ema.store()+copy_to() ran before the val loss loop.
                 decoded_metrics = _eval_decoded_metrics(
                     vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
                     use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
@@ -1000,6 +1017,31 @@ def train_unet_concat_control_paca(
                     sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
                     prediction_type=prediction_type, latent_scale=latent_scale,
                 )
+
+                if ema is not None and eval_raw_compare:
+                    # Swap back to raw weights for a parallel eval; doubles eval cost
+                    # but is the only way to see if EMA is actually helping.
+                    ema.restore()
+                    try:
+                        raw_metrics = _eval_decoded_metrics(
+                            vae, unet, controlnet, dr_module, control_adapter, diffusion, val_loader, device,
+                            use_controlnet, use_dr, control_source, controlnet_fusion, latent_mode, ddim_steps,
+                            amp_enabled, amp_dtype, max_val_patients=max_val_batches, sampler_init=sampler_init,
+                            sampler_t_start=sampler_t_start, sampler_alpha=sampler_alpha,
+                            prediction_type=prediction_type, latent_scale=latent_scale,
+                        )
+                    finally:
+                        # Re-stage EMA weights so the rest of the epoch (checkpoint save,
+                        # ema.restore at the end of the try block) finds the state it expects.
+                        ema.store()
+                        ema.copy_to()
+                    raw_metrics = {k.replace("val/", "val_raw/", 1): v for k, v in raw_metrics.items()}
+                    extra_metrics.update(raw_metrics)
+                    raw_mae = raw_metrics.get("val_raw/mae_hu")
+                    ema_mae = decoded_metrics.get("val/mae_hu")
+                    if raw_mae is not None and ema_mae is not None:
+                        extra_metrics["val/ema_gain_mae_hu"] = float(raw_mae) - float(ema_mae)
+                        extra_metrics["ema/effective_decay"] = ema._effective_decay()
 
             if wandb_logger:
                 wandb_logger.log_training_step(

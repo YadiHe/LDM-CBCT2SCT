@@ -9,10 +9,13 @@
 ## 0. TL;DR / 当前状态
 
 - **预处理 v2 已切换**：HU clip 改为 `[-1024, 2000]`，新增 `SetAirBackgroundd`（mask 外强制为空气），归一化后 mask 外 ≈ -1.0。**所有旧 checkpoint 不能直接续训**（latent 分布变了）。
-- **当前阻塞**：
-  1. 重新生成预处理数据（覆盖 `data/preprocessed/` 并刷新 `data/manifest.csv`）
-  2. 决定 VAE 是否重训（新数据分布与旧 VAE train set 不同）
-  3. D1/E1 重训 baseline
+- **当前进度**：
+  1. ✅ P0 预处理 v2 已生成（218 train + 23 val）
+  2. ✅ P1 旧 VAE 在 v2 上退化到 58 HU（> 10 HU 阈值），触发 P2
+  3. 🟢 **P2 进行中**：VAE v2 重训运行中（`scripts/launch_vae_v2.sh`，run `vae-v2-fp16-bc64-ep200`）
+  4. ⏳ P3 D1 baseline 等 P2 ep30 决策点
+- **AMP 决策（VAE 已锁）**：fp16。bf16 实测在 VAE 重建任务上 300 步 mae_hu 159 vs fp16 的 31（7-bit 尾数对前向 conv 累加精度不够），即使 loss 全部 fp32 reduce 也救不回。详见 §6.9。D/E 的 AMP 选择待实测对照，当前默认 bf16。
+- **EMA 实现升级**：`ModelEMA` 加 `num_updates` 自适应 warmup（`min(decay, (1+n)/(10+n))`），根治 cold-start 阶段 `raw > EMA` 现象。D1 训练支持 `--eval-raw-compare` 系统记录 `val/ema_gain_mae_hu`。详见 §6.10。
 - **已跑实验仅作历史参考**（基于预处理 v1：CLIP_MAX=1500、mask 外保留原 HU）。详见 §5。
 
 ---
@@ -344,12 +347,17 @@ WandB `8ypydmdw`，从 D1-bf16-drop01 ckpt 切 L1+Min-SNR+cosine+t999/noise：
 
 ### 6.1 立即（解锁 v2）
 
-| 步骤 | 内容 | 产物 |
-|---|---|---|
-| **P0** | 跑预处理 v2，覆盖 `data/preprocessed/` 并刷新 `data/manifest.csv` | 218+23 例 v2 数据 |
-| **P1** | 在 v2 数据上 eval 旧 VAE，看 mae_hu_vae 是否仍 ≈ 25 HU | 决定是否 P2 |
-| **P2** | 若 P1 退化 ≥ 10 HU：用 v2 train=218 重训 VAE | 新 `vae_best_v2.pth` |
-| **P3** | 在 v2 数据 + (旧或新) VAE 上重做 D1 baseline 50 ep（screening 等价） | v2 baseline MAE |
+| 步骤 | 状态 | 内容 | 产物 |
+|---|---|---|---|
+| **P0** | ✅ done | 跑预处理 v2，覆盖 `data/preprocessed/` 并刷新 `data/manifest.csv` | 218+23 例 v2 数据 |
+| **P1** | ✅ done | 在 v2 数据上 eval 旧 VAE，看 mae_hu_vae 是否仍 ≈ 25 HU；实测 58 HU，退化 33 HU | 触发 P2 |
+| **P2** | 🟢 running | 用 v2 train=218 重训 VAE，fp16 AMP，legacy PerceptualLoss | `checkpoints/vae_v2_fp16/vae_best.pth` |
+| **P3** | ⏳ blocked | 在 v2 数据 + 新 VAE 上重做 D1 baseline 50 ep（screening 等价） | v2 baseline MAE |
+
+**P2 决策点**（来自 `launch_vae_v2.sh`）：
+- ep10 mae_hu_vae < 35 HU → 正常，继续
+- ep30 < 28 HU → 路径 A：长训到 ep200
+- ep30 > 40 HU → 架构 review（kl_weight / latent_channels）
 
 ### 6.2 D1 主线（v2 上重新校准）
 
@@ -360,8 +368,8 @@ D1 = `UNet bc256 + ControlNet(cbct_latent) + region_emb`，`fusion=add`，活跃
 | 项 | 值 |
 |---|---|
 | `base_channels` | 256 |
-| EMA | 0.9995 |
-| AMP | bf16 |
+| EMA | 0.9995 上限 + num_updates warmup（§6.10）；建议带 `--eval-raw-compare` 验证 EMA 收益 |
+| AMP | bf16（待 fp16 实测对照；VAE 已锁 fp16 不可外推到 diffusion） |
 | Optimizer | AdamW wd=1e-4 |
 | LR schedule | `sd-warmup-constant`，warmup 1000，lr 3e-5 |
 | Loss | MSE，mask-weighted |
@@ -430,6 +438,38 @@ init ∈ {cbct, noise} × t_start ∈ {200,300,500,700,999} × ddim_steps ∈ {5
 | **B2** | ep50 卡 80–100 HU | ~1–2 天 | cosine + v_prediction 重训（≈ E1）；60–75 HU |
 | **B3** | ep50 > 90 HU 或 B2 不足 | ~1–2 周 | **MAISI 3D-RFlow**；50–65 HU |
 
+### 6.9 AMP 决策（fp16 vs bf16）
+
+**VAE：fp16 已锁**。`scripts/train_ct_vae.py` 仅 fp16 路径，commit `f0a427b` 清掉了 bf16 灵活性。
+
+| 模式 | 300 步 mae_hu（lr=6.25e-6） | ms/step | 峰值显存 |
+|---|---|---|---|
+| fp32 | 29.3 | 417 | 21.2 GB |
+| **fp16** | **31.0** | **316（1.32x）** | **19.2 GB** |
+| bf16 | 159.2 ❌ | 330 | 19.2 GB |
+
+bf16 不是数值溢出（loss 已全部 cast 到 fp32 算），是 7-bit 尾数对前向 conv 累加精度不够——像素级重建任务直接被前向精度卡死。这是 VAE/GAN 类生成模型的共性，不是本项目特有。
+
+**D/E：未实测，默认 bf16**。Diffusion 噪声预测的训练动态与 VAE 重建完全不同：attention 主导、激活动态范围大、单 step 误差会被多 step 平均掉，工业上（SD/SDXL/Imagen/Flux）一致选 bf16。VAE 结论**不能外推**。等 D1 v2 baseline 跑通后做一次 5 ep 的 fp16 vs bf16 对照，再锁结论。
+
+**PerceptualLoss 关联**：VAE 用 fp16 + legacy PerceptualLoss（VGG 收 `[-1,1]` 直接 ImageNet normalize）。`utils/losses.py` commit `c4d49e0` 加的 `[-1,1]→[0,1]` 归一化已被 `f0a427b` 回退。原因：`perceptual_weight=0.1` 是与 "VGG 越界" 配套调出的；数学正确版需要 `perceptual_weight≈1.0` 才能匹敌（实测 300 步 mae_hu legacy 29 vs fixed-pw0.1 44；fixed-pw1.0 32）。保留 legacy 避免重调全套超参。
+
+### 6.10 EMA 实现（D/E）
+
+`ModelEMA`（`models/unetConcatControlPACA.py`）改进：
+
+1. **自适应 warmup**：每步实际 decay 为 `min(decay, (1+n)/(10+n))`，n=`num_updates`。上限 0.9995 对应 1386 步半衰期，但 step=100 时 effective decay 仅 0.92、step=1000 才到 0.991。**根治 cold-start**：早期 shadow 不再拖着初始随机权重。
+2. **state_dict 持久化 `num_updates`**：断点续训 warmup 进度不丢。旧 ckpt 没这个字段时默认 0（重新 warmup，可接受）。
+3. **raw vs EMA 并行 eval**：`scripts/train_concat_paca.py --eval-raw-compare`（默认关）。打开后每个 `eval_every` epoch 会跑两次 patient-level eval：
+   - `val/mae_hu`：EMA 权重（保持原 best ckpt 选择规则）
+   - `val_raw/mae_hu`：raw 权重
+   - `val/ema_gain_mae_hu = raw - ema`：正数代表 EMA 在帮忙
+   - `ema/effective_decay`：实时看 warmup 进度
+
+   代价：eval 时间翻倍（每 patient 多一次 DDIM sample）。仅在诊断 EMA 是否真有帮助时打开。
+
+下游决策规则：连续 2 次 `val/ema_gain_mae_hu < 0` → 把 `ema_decay` 上限往下调一档（0.9995 → 0.999），不要直接跳到 0.995（半衰期 138 步 ≈ 关 EMA）。
+
 ---
 
 ## 7. 产物清单与命名
@@ -438,7 +478,7 @@ init ∈ {cbct, noise} × t_start ∈ {200,300,500,700,999} × ddim_steps ∈ {5
 checkpoints/phase1_matrix/{run_name}/
   ├── unet_full.pth          # raw UNet（续训用）
   ├── unet_ema.pth           # EMA（推理用）
-  ├── unet_ema_state.pth     # EMA state（shadow + decay，续训 EMA 用）
+  ├── unet_ema_state.pth     # EMA state（shadow + decay + num_updates，续训 EMA 用；旧 ckpt 无 num_updates 默认 0 重新 warmup）
   ├── controlnet_full.pth    # raw ControlNet（续训用）
   ├── controlnet.pth         # EMA ControlNet（推理用）
   ├── control_adapter_full.pth / control_adapter.pth

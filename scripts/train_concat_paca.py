@@ -132,6 +132,9 @@ def parse_args():
                    help="CBCT latent strength when --sampler-init=cbct")
     p.add_argument("--eval-every", type=int, default=10,
                    help="run decoded metrics and fixed-val image upload every N epochs")
+    p.add_argument("--eval-raw-compare", action="store_true",
+                   help="when EMA is on, also evaluate raw weights and log val_raw/* metrics. "
+                        "Doubles eval cost; useful for diagnosing raw vs EMA gap")
     p.add_argument("--seed", type=int, default=42)
 
     # WandB
@@ -378,6 +381,7 @@ def main():
                 "timestep_sampling": args.timestep_sampling,
                 "latent_scale": args.latent_scale,
                 "eval_every": args.eval_every,
+                "eval_raw_compare": args.eval_raw_compare,
                 "early_stopping": args.early_stopping,
                 "max_train_batches": args.max_train_batches,
                 "max_val_batches": args.max_val_batches,
@@ -427,6 +431,7 @@ def main():
             sampler_t_start=args.sampler_t_start,
             sampler_alpha=args.sampler_alpha,
             eval_every=args.eval_every,
+            eval_raw_compare=args.eval_raw_compare,
             fixed_val_batch=fixed_val_batch,
             fixed_val_max_images=args.fixed_val_max_images,
             loss_type=args.loss_type,
