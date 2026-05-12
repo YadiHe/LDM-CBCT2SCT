@@ -369,15 +369,54 @@ def _add_panel_label(image, label):
     return out
 
 
-def _make_comparison_panel(cbct, ct, sct, error):
+def _make_error_colorbar(height: int, max_hu: int = 300, bar_w: int = 8, label_w: int = 28):
+    """Vertical grayscale colorbar with HU tick labels.
+
+    Top = `max_hu` (white = saturated error), bottom = 0 HU (black = no error).
+    Matches the `error.clamp(0, max_hu) / max_hu` normalization used upstream.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return np.zeros((height, bar_w + label_w, 3), dtype=np.float32)
+
+    gradient = np.linspace(1.0, 0.0, height, dtype=np.float32)[:, None]   # (H, 1)
+    bar_rgb = np.repeat(np.tile(gradient, (1, bar_w))[..., None], 3, axis=2)
+    labels  = np.zeros((height, label_w, 3), dtype=np.float32)
+    canvas  = np.concatenate([bar_rgb, labels], axis=1)
+
+    pil = Image.fromarray((canvas * 255).astype(np.uint8))
+    draw = ImageDraw.Draw(pil)
+    # 5 evenly-spaced ticks for readability
+    n_ticks = 5
+    for i in range(n_ticks):
+        y_frac = i / (n_ticks - 1)
+        y_px   = int(round(y_frac * (height - 1)))
+        hu     = int(round((1.0 - y_frac) * max_hu))
+        # short tick mark
+        tick_y = min(max(y_px, 0), height - 1)
+        draw.line([(bar_w - 2, tick_y), (bar_w + 1, tick_y)], fill=(255, 255, 255))
+        # text just right of bar (avoid clipping at edges)
+        text_y = max(min(tick_y - 6, height - 14), 0)
+        draw.text((bar_w + 3, text_y), f"{hu}", fill=(255, 255, 255))
+    return np.asarray(pil).astype(np.float32) / 255.0
+
+
+def _make_comparison_panel(cbct, ct, sct, error, error_max_hu: int = 300, error_label: str = None):
+    error_label = error_label or f"|err| /{error_max_hu}HU"
     panels = [
         _add_panel_label(cbct, "CBCT"),
         _add_panel_label(ct, "CT"),
         _add_panel_label(sct, "sCT"),
-        _add_panel_label(error, "|err|"),
+        _add_panel_label(error, error_label),
     ]
-    separator = np.ones((panels[0].shape[0], 3, 3), dtype=panels[0].dtype)
-    return np.concatenate([panels[0], separator, panels[1], separator, panels[2], separator, panels[3]], axis=1)
+    H = panels[0].shape[0]
+    separator = np.ones((H, 3, 3), dtype=panels[0].dtype)
+    colorbar  = _make_error_colorbar(height=H, max_hu=error_max_hu)
+    return np.concatenate(
+        [panels[0], separator, panels[1], separator, panels[2], separator, panels[3], separator, colorbar],
+        axis=1,
+    )
 
 
 def _encode_vae(vae, x, latent_mode="mu", latent_scale=1.0):
